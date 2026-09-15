@@ -6471,6 +6471,7 @@ Returns percentage change from oldValue to newValue after automatic conversion.
 function Bnum.PercentChange(oldValue: any, newValue: any): Value
 	return Bnum.percentChange(convertAny(oldValue), convertAny(newValue))
 end
+
 --[[
 Formats any supported input using the selected format mode.
 Example: Bnum.Format("1250000", 2, "standard") -> formatted text
@@ -6596,6 +6597,105 @@ Automatically selects a suitable notation for any supported input.
 ]]
 function Bnum.AutoFormat(value: any, digits: number?, options: AutoFormatOptions?): string
 	return Bnum.autoFormat(convertAny(value), digits, options)
+end
+
+--[[
+Adds two converted inputs directly into an existing output Bnum table.
+The output table itself is reused and is not converted.
+]]
+function Bnum.AddInto(out: Value, a: any, b: any): Value
+	return Bnum.addInto(out, convertAny(a), convertAny(b))
+end
+
+--[[
+Subtracts two converted inputs directly into an existing output Bnum table.
+]]
+function Bnum.SubInto(out: Value, a: any, b: any): Value
+	return Bnum.subInto(out, convertAny(a), convertAny(b))
+end
+
+--[[
+Multiplies two converted inputs directly into an existing output Bnum table.
+]]
+function Bnum.MulInto(out: Value, a: any, b: any): Value
+	return Bnum.mulInto(out, convertAny(a), convertAny(b))
+end
+
+--[[
+Divides two converted inputs directly into an existing output Bnum table.
+]]
+function Bnum.DivInto(out: Value, a: any, b: any): Value
+	return Bnum.divInto(out, convertAny(a), convertAny(b))
+end
+
+--[[
+Raises a converted input to a normal numeric power directly into out.
+]]
+function Bnum.PowInto(out: Value, value: any, power: number): Value
+	return Bnum.powInto(out, convertAny(value), power)
+end
+
+--[[
+Adds a normal number to a converted Bnum input directly into out.
+]]
+function Bnum.AddNumberInto(out: Value, value: any, n: number): Value
+	return Bnum.addNumberInto(out, convertAny(value), n)
+end
+
+--[[
+Subtracts a normal number from a converted Bnum input directly into out.
+]]
+function Bnum.SubNumberInto(out: Value, value: any, n: number): Value
+	return Bnum.subNumberInto(out, convertAny(value), n)
+end
+
+--[[
+Multiplies a converted Bnum input by a normal number directly into out.
+]]
+function Bnum.MulNumberInto(out: Value, value: any, n: number): Value
+	return Bnum.mulNumberInto(out, convertAny(value), n)
+end
+
+--[[
+Divides a converted Bnum input by a normal number directly into out.
+]]
+function Bnum.DivNumberInto(out: Value, value: any, n: number): Value
+	return Bnum.divNumberInto(out, convertAny(value), n)
+end
+
+--[[
+Scales a converted input by 10^exponent directly into out.
+]]
+function Bnum.Scale10Into(out: Value, value: any, exponent: number): Value
+	return Bnum.scale10Into(out, convertAny(value), exponent)
+end
+
+--[[
+Squares a converted input directly into out.
+]]
+function Bnum.SquareInto(out: Value, value: any): Value
+	return Bnum.squareInto(out, convertAny(value))
+end
+
+--[[
+Cubes a converted input directly into out.
+]]
+function Bnum.CubeInto(out: Value, value: any): Value
+	return Bnum.cubeInto(out, convertAny(value))
+end
+
+--[[
+Computes a × b + c from converted inputs directly into out.
+]]
+function Bnum.MulAddInto(out: Value, a: any, b: any, c: any): Value
+	return Bnum.mulAddInto(out, convertAny(a), convertAny(b), convertAny(c))
+end
+
+--[[
+Computes a + b × c from converted inputs directly into out.
+]]
+function Bnum.AddMulInto(out: Value, a: any, b: any, c: any): Value
+	return Bnum.addMulInto(out, convertAny(a), convertAny(b), convertAny(c))
 end
 
 return Bnum
