@@ -5974,6 +5974,161 @@ local function convertAny(value: any): Value
 	end
 	return converted
 end
+
+--[[
+Creates a Bnum from a mantissa and base-10 exponent.
+This is the PascalCase convenience name for Bnum.new.
+Example: Bnum.New(9.5, 3) -> 9500
+]]
+function Bnum.New(man: number?, exp: number?): Value
+	return Bnum.new(man, exp)
+end
+
+--[[
+Creates a canonical Bnum directly from sign and log10 magnitude.
+This is the PascalCase convenience name for Bnum.raw.
+Example: Bnum.Raw(1, 3) -> 1000
+]]
+function Bnum.Raw(sign: number, logMagnitude: number): Value
+	return Bnum.raw(sign, logMagnitude)
+end
+
+--[[
+Clones any supported Bnum input after converting it automatically.
+Example: Bnum.Clone("1e6") -> a new Bnum representing 1e6
+]]
+function Bnum.Clone(value: any): Value
+	return Bnum.clone(convertAny(value))
+end
+
+--[[
+Reads the canonical sign and log10 magnitude from any supported input.
+Example: Bnum.Read(1000) -> 1, 3
+]]
+function Bnum.Read(value: any): (number, number)
+	return Bnum.read(convertAny(value))
+end
+
+--[[
+Creates a Bnum from a normal Luau number.
+This is the PascalCase convenience name for Bnum.fromNumber.
+]]
+function Bnum.FromNumber(value: number): Value
+	return Bnum.fromNumber(value)
+end
+
+--[[
+Creates a Bnum from a public {mantissa, exponent} table.
+This is the PascalCase convenience name for Bnum.fromTable.
+]]
+function Bnum.FromTable(value: {any}): Value
+	return Bnum.fromTable(value)
+end
+
+--[[
+Converts any supported input and returns a normalized public {mantissa, exponent} table.
+Example: Bnum.ToTable("9500") -> about {9.5, 3}
+]]
+function Bnum.ToTable(value: any): Value
+	return Bnum.toTable(convertAny(value))
+end
+
+--[[
+Normalizes any supported Bnum input.
+Example: Bnum.Normalize("1e6") -> canonical Bnum for 1e6
+]]
+function Bnum.Normalize(value: any): Value
+	return Bnum.normalize(convertAny(value))
+end
+
+--[[
+Checks whether a value is a valid Bnum-compatible table.
+This directly preserves Bnum.isValid behavior.
+]]
+function Bnum.IsValid(value: any): boolean
+	return Bnum.isValid(value)
+end
+
+--[[
+Converts a number, string, or table into a canonical Bnum.
+This is the PascalCase convenience name for Bnum.convert.
+]]
+function Bnum.Convert(value: any): Value?
+	return Bnum.convert(value)
+end
+
+--[[
+Creates a Bnum from scientific mantissa × 10^exponent form.
+Example: Bnum.FromScientific(9.5, 3) -> 9500
+]]
+function Bnum.FromScientific(man: number, exp: number): Value
+	return Bnum.fromScientific(man, exp)
+end
+
+--[[
+Creates a Bnum directly from log10 magnitude and an optional sign.
+Example: Bnum.FromLog10(3, 1) -> 1000
+]]
+function Bnum.FromLog10(logMagnitude: number, sign: number?): Value
+	return Bnum.fromLog10(logMagnitude, sign)
+end
+
+--[[
+Creates 10^exponent directly.
+Example: Bnum.Pow10(6) -> 1e6
+]]
+function Bnum.Pow10(exponent: number): Value
+	return Bnum.pow10(exponent)
+end
+
+--[[
+Parses a string into a Bnum.
+Example: Bnum.FromString("1.25M") -> 1.25e6
+]]
+function Bnum.FromString(value: string): Value
+	return Bnum.fromString(value)
+end
+
+--[[
+Converts any supported input back to a normal Luau number when representable.
+Example: Bnum.ToNumber("1000") -> 1000
+]]
+function Bnum.ToNumber(value: any): number
+	return Bnum.toNumber(convertAny(value))
+end
+
+--[[
+Returns the scientific mantissa and exponent for any supported input.
+Example: Bnum.ToScientific(9500) -> 9.5, 3
+]]
+function Bnum.ToScientific(value: any): (number, number)
+	return Bnum.toScientific(convertAny(value))
+end
+
+--[[
+Returns the scientific mantissa for any supported input.
+Example: Bnum.Mantissa(9500) -> 9.5
+]]
+function Bnum.Mantissa(value: any): number
+	return Bnum.mantissa(convertAny(value))
+end
+
+--[[
+Returns the scientific exponent for any supported input.
+Example: Bnum.Exponent(9500) -> 3
+]]
+function Bnum.Exponent(value: any): number
+	return Bnum.exponent(convertAny(value))
+end
+
+--[[
+Serializes any supported input to Bnum scientific text.
+Example: Bnum.ToString(9500) -> "9.5e3"
+]]
+function Bnum.ToString(value: any): string
+	return Bnum.toString(convertAny(value))
+end
+
 --[[
 Adds two supported values without requiring Bnum.convert at the call site.
 Example: Bnum.Add(10, "25") -> 35
@@ -6470,6 +6625,77 @@ Returns percentage change from oldValue to newValue after automatic conversion.
 ]]
 function Bnum.PercentChange(oldValue: any, newValue: any): Value
 	return Bnum.percentChange(convertAny(oldValue), convertAny(newValue))
+end
+
+--[[
+Checks whether a converted value is zero.
+]]
+function Bnum.IsZero(value: any): boolean
+	return Bnum.isZero(convertAny(value))
+end
+
+--[[
+Checks whether a converted value is NaN.
+]]
+function Bnum.IsNaN(value: any): boolean
+	return Bnum.isNaN(convertAny(value))
+end
+
+--[[
+Checks whether a converted value is positive or negative infinity.
+]]
+function Bnum.IsInfinite(value: any): boolean
+	return Bnum.isInfinite(convertAny(value))
+end
+
+--[[
+Checks whether a converted value is finite.
+]]
+function Bnum.IsFinite(value: any): boolean
+	return Bnum.isFinite(convertAny(value))
+end
+
+--[[
+Checks whether a converted value is strictly positive.
+]]
+function Bnum.IsPositive(value: any): boolean
+	return Bnum.isPositive(convertAny(value))
+end
+
+--[[
+Checks whether a converted value is strictly negative.
+]]
+function Bnum.IsNegative(value: any): boolean
+	return Bnum.isNegative(convertAny(value))
+end
+
+--[[
+Returns -1, 0, or 1 for the sign of any supported input.
+]]
+function Bnum.Sign(value: any): number
+	return Bnum.sign(convertAny(value))
+end
+
+--[[
+Returns the suffix for a numeric suffix tier.
+This directly preserves Bnum.getSuffix behavior.
+]]
+function Bnum.GetSuffix(tier: number): string?
+	return Bnum.getSuffix(tier)
+end
+
+--[[
+Checks whether a string names a supported format mode.
+]]
+function Bnum.IsFormatType(formatType: string): boolean
+	return Bnum.isFormatType(formatType)
+end
+
+--[[
+Changes the module's default format mode.
+]]
+function Bnum.SetDefaultFormat(formatType: string): boolean
+	return Bnum.setDefaultFormat(formatType)
 end
 
 --[[
