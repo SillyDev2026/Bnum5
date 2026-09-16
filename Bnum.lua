@@ -5,13 +5,6 @@ local Bnum = {}
 
 Bnum.Version = "1.6.0"
 
--- Bnum v1.6.0 math-kernel rebuild.
--- Canonical storage remains {sign, log10(abs(value))}.
--- Common finite arithmetic stays inline on the public fast path.
--- Rare NaN/infinity/zero/cancellation cases use private hard-path kernels.
--- Higher-level math reuses raw kernels instead of duplicating hundreds of lines.
--- toString() is normalized scientific; toBnumString() preserves logMagnitude.
-
 export type Value = {number}
 export type FormatType = "standard" | "extended" | "hybrid" | "alphabetic" | "metric" | "exponent" | "scientific" | "engineering" | "roman" | "romanextended" | "plain" | "comma" | "logarithm" | "raw"
 
