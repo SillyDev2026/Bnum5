@@ -3,18 +3,17 @@
 
 local Bnum = {}
 
-Bnum.Version = "1.4.0"
+Bnum.Version = "1.6.0"
+
+-- Bnum v1.6.0 math-kernel rebuild.
+-- Canonical storage remains {sign, log10(abs(value))}.
+-- Common finite arithmetic stays inline on the public fast path.
+-- Rare NaN/infinity/zero/cancellation cases use private hard-path kernels.
+-- Higher-level math reuses raw kernels instead of duplicating hundreds of lines.
+-- toString() is normalized scientific; toBnumString() preserves logMagnitude.
 
 export type Value = {number}
-export type FormatType = "standard" | "extended" | "hybrid" | "alphabetic" | "metric" | "exponent" | "scientific" | "engineering" | "roman" | "romanextended" | "plain" | "comma" | "logarithm" | "raw" | "Auto" | "Suffix" | "SuffixLong" | "Scientific" | "Engineering" | "Standard" | "Comma" | "Logarithm" | "Raw"
-export type AutoFormatOptions = {
-	Digits: number?,
-	SmallScientificAt: number?,
-	SuffixAt: number?,
-	SuffixMaxTier: number?,
-	LongSuffix: boolean?,
-	LogarithmAt: number?,
-}
+export type FormatType = "standard" | "extended" | "hybrid" | "alphabetic" | "metric" | "exponent" | "scientific" | "engineering" | "roman" | "romanextended" | "plain" | "comma" | "logarithm" | "raw"
 
 local LN10 = 2.302585092994046
 local LOG10_2 = 0.3010299956639812
@@ -30,6 +29,34 @@ local CLOSE_CANCEL = -1e-4
 local INTEGER_SNAP_REL = 8.881784197001252e-16
 local MAX_EXACT_INTEGER = 9007199254740992
 local MANTISSA_CLEAN_FACTOR = 100000000000000
+
+-- Leaderboard numeric codec v2.
+--
+-- The codec transforms logMagnitude directly:
+--     u = sign(logMagnitude) * log10(1 + abs(logMagnitude))
+--
+-- u is then quantized into a safe integer band below 2^52. This gives:
+--   * sortable integer scores,
+--   * stable round-trips across the entire finite f64 logMagnitude range,
+--   * distinct values below 1 instead of collapsing tiny magnitudes to zero,
+--   * a code range that does not overlap the v1.4.1 codec range.
+local MAX_FINITE_DOUBLE = 1.7976931348623157e308
+local LB_CODEC_VERSION = 2
+local LB_SCALE = 4398046511104 -- 2^42
+local LB_CENTER_CODE = math.round((MAX_LOG10_DOUBLE + 1) * LB_SCALE)
+local LB_LOG_SPAN_CODE = math.round(MAX_LOG10_DOUBLE * LB_SCALE)
+local LB_MIN_FINITE_CODE = LB_CENTER_CODE - LB_LOG_SPAN_CODE
+local LB_MAX_FINITE_CODE = LB_CENTER_CODE + LB_LOG_SPAN_CODE
+local LB_INFINITY_CODE = LB_MAX_FINITE_CODE + 1
+local LB_NAN_CODE = LB_MAX_FINITE_CODE + 2
+
+Bnum.LB_CODEC_VERSION = LB_CODEC_VERSION
+Bnum.LB_SCALE = LB_SCALE
+Bnum.LB_CENTER_CODE = LB_CENTER_CODE
+Bnum.LB_MIN_FINITE_CODE = LB_MIN_FINITE_CODE
+Bnum.LB_MAX_FINITE_CODE = LB_MAX_FINITE_CODE
+Bnum.LB_INFINITY_CODE = LB_INFINITY_CODE
+Bnum.LB_NAN_CODE = LB_NAN_CODE
 
 local factorialLogs = table.create(171)
 factorialLogs[1] = 0
@@ -352,151 +379,170 @@ function Bnum.pow10(exp: number): Value
 end
 
 --[[
-Parses decimal, scientific, infinity, NaN, and supported suffix strings.
-Example: "1.25M" -> 1.25e6
+Parses decimal, scientific, Bnum-style exponent, infinity, NaN, and suffix strings.
+
+Normal scientific notation keeps the familiar integer-exponent form:
+"9.5e3" -> 9500
+
+Bnum-style strings may store the logarithmic exponent directly:
+"1e3.9777236052888477" -> 9500
+
+The exponent itself may also use normal numeric scientific notation:
+"1e1e6" -> 10^(1e6)
+
+Supported suffix strings remain available:
+"1.25M" -> 1.25e6
 ]]
 function Bnum.fromString(str: string): Value
 	local length = #str
 	if length == 0 then return {0, 0 / 0} end
 
+	-- Fast path for ordinary finite decimal/scientific strings.
 	local direct = tonumber(str)
 	if direct ~= nil then
-		local magnitude = math.abs(direct)
-		if magnitude < math.huge then
-			if magnitude == 0 then return {0, 0} end
-			return {math.sign(direct), math.log10(magnitude)}
+		if direct > -math.huge and direct < math.huge then
+			if direct > 0 then return {1, math.log10(direct)} end
+			if direct < 0 then return {-1, math.log10(-direct)} end
+			return {0, 0}
 		end
 		if direct ~= direct then return {0, 0 / 0} end
 	end
 
 	local first = 1
 	local last = length
-	local c = string.byte(str, first)
-	while c == 32 or c == 9 or c == 10 or c == 13 do
+
+	while first <= last do
+		local byte = string.byte(str, first)
+		if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then break end
 		first += 1
-		if first > last then return {0, 0 / 0} end
-		c = string.byte(str, first)
-	end
-	local tail = string.byte(str, last)
-	while tail == 32 or tail == 9 or tail == 10 or tail == 13 do
-		last -= 1
-		tail = string.byte(str, last)
 	end
 
-	local sign = 1
-	if c == 45 then
-		sign = -1
-		first += 1
-		c = string.byte(str, first)
-	elseif c == 43 then
-		first += 1
-		c = string.byte(str, first)
+	while last >= first do
+		local byte = string.byte(str, last)
+		if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then break end
+		last -= 1
 	end
+
 	if first > last then return {0, 0 / 0} end
 
-	if c == 73 or c == 105 or c == 78 or c == 110 then
-		local special = string.lower(string.sub(str, first, last))
-		if special == "inf" or special == "infinity" then return {sign, math.huge} end
-		if special == "nan" then return {0, 0 / 0} end
+	local sign = 1
+	local firstByte = string.byte(str, first)
+	if firstByte == 45 then
+		sign = -1
+		first += 1
+	elseif firstByte == 43 then
+		first += 1
 	end
 
+	if first > last then return {0, 0 / 0} end
+
+	local special = string.lower(string.sub(str, first, last))
+	if special == "inf" or special == "infinity" then return {sign, math.huge} end
+	if special == "nan" then return {0, 0 / 0} end
+
+	-- Strip a trailing suffix before parsing the numeric body.
 	local suffixTier = 0
-	if (tail >= 65 and tail <= 90) or (tail >= 97 and tail <= 122) then
+	local tailByte = string.byte(str, last)
+	if (tailByte >= 65 and tailByte <= 90) or (tailByte >= 97 and tailByte <= 122) then
 		local suffixEnd = last
 		repeat
 			last -= 1
 			if last < first then return {0, 0 / 0} end
-			tail = string.byte(str, last)
-		until not ((tail >= 65 and tail <= 90) or (tail >= 97 and tail <= 122))
-		local suffix = string.lower(string.sub(str, last + 1, suffixEnd))
-		local found = suffixLookup[suffix]
+			tailByte = string.byte(str, last)
+		until not ((tailByte >= 65 and tailByte <= 90) or (tailByte >= 97 and tailByte <= 122))
+
+		local suffixText = string.lower(string.sub(str, last + 1, suffixEnd))
+		local found = suffixLookup[suffixText]
 		if found == nil then return {0, 0 / 0} end
 		suffixTier = found
-		while tail == 32 or tail == 9 or tail == 10 or tail == 13 do
+
+		while last >= first do
+			tailByte = string.byte(str, last)
+			if tailByte ~= 32 and tailByte ~= 9 and tailByte ~= 10 and tailByte ~= 13 then break end
 			last -= 1
-			if last < first then return {0, 0 / 0} end
-			tail = string.byte(str, last)
 		end
+
+		if last < first then return {0, 0 / 0} end
 	end
 
+	-- Parse the mantissa while retaining only the first 17 significant digits.
+	-- normalizedExponent tracks the decimal position, so long digit strings do
+	-- not need to materialize as a native number.
 	local i = first
 	local dot = 0
+	local digitCount = 0
 	local firstSignificant = 0
 	local significant = 0
 	local significantDigits = 0
+
 	while i <= last do
-		c = string.byte(str, i)
-		if c >= 48 and c <= 57 then
-			if significantDigits == 17 then
-				local stop = string.find(str, "[^0-9]", i + 1)
-				i = if stop ~= nil and stop <= last then stop else last + 1
-			elseif c == 48 and significantDigits == 0 then
-				local stop = string.find(str, "[^0]", i + 1)
-				i = if stop ~= nil and stop <= last then stop else last + 1
-			else
-				if significantDigits == 0 then firstSignificant = i end
-				significant = significant * 10 + (c - 48)
+		local byte = string.byte(str, i)
+
+		if byte >= 48 and byte <= 57 then
+			digitCount += 1
+			if firstSignificant == 0 then
+				if byte ~= 48 then
+					firstSignificant = i
+					significant = byte - 48
+					significantDigits = 1
+				end
+			elseif significantDigits < 17 then
+				significant = significant * 10 + (byte - 48)
 				significantDigits += 1
-				i += 1
 			end
-		elseif c == 46 and dot == 0 then
+			i += 1
+		elseif byte == 46 and dot == 0 then
 			dot = i
 			i += 1
 		else
 			break
 		end
 	end
-	if i == first or (i == first + 1 and dot == first) then return {0, 0 / 0} end
 
-	local normalizedExponent = i - firstSignificant - 1
-	if dot ~= 0 then
+	if digitCount == 0 then return {0, 0 / 0} end
+
+	local explicitExponent = 0
+	if i <= last then
+		local byte = string.byte(str, i)
+		if byte ~= 69 and byte ~= 101 then return {0, 0 / 0} end
+
+		i += 1
+		if i > last then return {0, 0 / 0} end
+
+		-- Parsing the exponent separately lets Bnum-style strings use decimal
+		-- exponents and lets very large stored log exponents use native
+		-- scientific text such as "1e1e308".
+		local exponentText = string.sub(str, i, last)
+		explicitExponent = tonumber(exponentText)
+		if explicitExponent == nil or explicitExponent ~= explicitExponent then
+			return {0, 0 / 0}
+		end
+	end
+
+	if firstSignificant == 0 then return {0, 0} end
+
+	local normalizedExponent
+	if dot == 0 then
+		normalizedExponent = last - firstSignificant
+		if i <= last then
+			normalizedExponent = (i - 2) - firstSignificant
+		end
+	else
 		normalizedExponent = dot - firstSignificant
 		if firstSignificant < dot then normalizedExponent -= 1 end
 	end
 
-	local explicitExponent = 0
+	-- When an explicit exponent exists, normalizedExponent must be based only
+	-- on the mantissa region, not on the exponent text.
 	if i <= last then
-		if c ~= 69 and c ~= 101 then return {0, 0 / 0} end
-		i += 1
-		if i > last then return {0, 0 / 0} end
-		local exponentSign = 1
-		c = string.byte(str, i)
-		if c == 45 then
-			exponentSign = -1
-			i += 1
-		elseif c == 43 then
-			i += 1
+		local mantissaEnd = i - 2
+		if dot == 0 then
+			normalizedExponent = mantissaEnd - firstSignificant
 		end
-		if i > last then return {0, 0 / 0} end
-		if last - i < 15 then
-			while i <= last do
-				c = string.byte(str, i)
-				if c < 48 or c > 57 then return {0, 0 / 0} end
-				explicitExponent = explicitExponent * 10 + (c - 48)
-				i += 1
-			end
-		else
-			local stop = string.find(str, "[^0]", i)
-			i = if stop ~= nil and stop <= last then stop else last + 1
-			while i <= last do
-				c = string.byte(str, i)
-				if c < 48 or c > 57 then return {0, 0 / 0} end
-				if explicitExponent < 1e307 then
-					explicitExponent = explicitExponent * 10 + (c - 48)
-				else
-					local invalid = string.find(str, "[^0-9]", i + 1)
-					if invalid ~= nil and invalid <= last then return {0, 0 / 0} end
-					explicitExponent = math.huge
-					break
-				end
-				i += 1
-			end
-		end
-		if exponentSign < 0 then explicitExponent = -explicitExponent end
 	end
 
-	if firstSignificant == 0 then return {0, 0} end
 	local logMagnitude = explicitExponent + suffixTier * 3 + normalizedExponent + math.log10(significant) - (significantDigits - 1)
+
 	if logMagnitude ~= logMagnitude then return {0, 0 / 0} end
 	if logMagnitude == -math.huge then return {0, 0} end
 	return {sign, logMagnitude}
@@ -585,28 +631,205 @@ function Bnum.exponent(val: Value): number
 	return exp
 end
 
+--[[
+Serializes a Bnum using conventional normalized scientific notation.
+
+The exponent is always an integer exponent:
+9500 -> "9.5e3"
+
+Use toBnumString() when the stored logarithmic exponent should be preserved.
+]]
 function Bnum.toString(val: Value): string
 	local sign = val[1]
 	local logMagnitude = val[2]
-	if sign == 0 then
-		if logMagnitude ~= logMagnitude then return "nan" end
-		return "0"
-	end
+
+	if logMagnitude ~= logMagnitude then return "nan" end
+	if sign == 0 then return "0" end
 	if logMagnitude == math.huge then return if sign < 0 then "-inf" else "inf" end
 
 	local exp = math.floor(logMagnitude)
 	local man = sign * (10 ^ (logMagnitude - exp))
 	man = math.round(man * MANTISSA_CLEAN_FACTOR) / MANTISSA_CLEAN_FACTOR
+
 	if man >= 10 or man <= -10 then
 		man *= 0.1
 		exp += 1
 	end
-	return man .. "e" .. exp
+
+	return tostring(man) .. "e" .. string.format("%.0f", exp)
 end
 
 --[[
-Adds two Bnums using direct log-space arithmetic.
-Example: 1 + 1 -> 2, stored as about {1, 0.3010299956639812}
+Serializes the Bnum using its stored logarithmic exponent.
+
+This is the Bnum-storage style rather than normalized scientific notation:
+9500 -> "1e3.9777236052888477"
+-9500 -> "-1e3.9777236052888477"
+
+For very large logMagnitude values the exponent text may itself use native
+scientific notation, for example "1e1e+308". fromString() understands this
+form and reconstructs the stored logarithmic exponent.
+
+Use toString() when a conventional mantissa + integer exponent is wanted.
+]]
+function Bnum.toBnumString(val: Value): string
+	local sign = val[1]
+	local logMagnitude = val[2]
+
+	if logMagnitude ~= logMagnitude then return "nan" end
+	if sign == 0 then return "0" end
+	if logMagnitude == math.huge then return if sign < 0 then "-inf" else "inf" end
+
+	local prefix = if sign < 0 then "-1e" else "1e"
+	return prefix .. string.format("%.17g", logMagnitude)
+end
+
+--==============================================================
+-- Private raw math kernel
+--==============================================================
+
+--[[
+The public arithmetic API uses a two-level design.
+
+FAST PATH
+---------
+The common finite/canonical cases stay directly inside add/sub/mul/div and the
+number-specialized variants. This avoids an extra Lua-level helper call where
+games spend most of their arithmetic time.
+
+HARD PATH
+---------
+Rare cases such as NaN, infinities, signed zero, close cancellation, and mixed
+signs are routed through the raw helpers below.
+
+The helpers return raw `(sign, logMagnitude)` pairs so higher-level functions
+can reuse the same edge-case math without allocating temporary Bnum tables.
+]]
+
+local function rawAddHard(s1: number, l1: number, s2: number, l2: number): (number, number)
+	if l1 ~= l1 or l2 ~= l2 then return 0, 0 / 0 end
+	if s1 == 0 then return s2, l2 end
+	if s2 == 0 then return s1, l1 end
+
+	if s1 == s2 then
+		if l1 == l2 then
+			if l1 == math.huge then return s1, math.huge end
+			return s1, l1 + LOG10_2
+		end
+
+		local hi = l1
+		local lo = l2
+		if lo > hi then hi, lo = lo, hi end
+		if hi == math.huge then return s1, math.huge end
+
+		local delta = lo - hi
+		if delta < ADD_CUTOFF then return s1, hi end
+		return s1, hi + math.log10(1 + math.exp(delta * LN10))
+	end
+
+	if l1 == l2 then
+		if l1 == math.huge then return 0, 0 / 0 end
+		return 0, 0
+	end
+
+	local hiS
+	local hiL
+	local loL
+	if l1 > l2 then
+		hiS, hiL, loL = s1, l1, l2
+	else
+		hiS, hiL, loL = s2, l2, l1
+	end
+
+	if hiL == math.huge then return hiS, math.huge end
+
+	local delta = loL - hiL
+	if delta < ADD_CUTOFF then return hiS, hiL end
+	if delta > -1e-300 then return hiS, hiL + math.log10(-delta) + LOG10_LN10 end
+
+	local difference
+	if delta > CLOSE_CANCEL then
+		local x = -delta * LN10
+		difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
+	else
+		difference = 1 - math.exp(delta * LN10)
+	end
+
+	if difference <= 0 then return 0, 0 end
+	return hiS, hiL + math.log10(difference)
+end
+
+local function rawAdd(s1: number, l1: number, s2: number, l2: number): (number, number)
+	if s1 == s2 and s1 ~= 0 and l1 == l1 and l2 == l2 and l1 < math.huge and l2 < math.huge then
+		if l1 == l2 then return s1, l1 + LOG10_2 end
+
+		local hi = l1
+		local lo = l2
+		if lo > hi then hi, lo = lo, hi end
+
+		local delta = lo - hi
+		if delta < ADD_CUTOFF then return s1, hi end
+		return s1, hi + math.log10(1 + math.exp(delta * LN10))
+	end
+
+	return rawAddHard(s1, l1, s2, l2)
+end
+
+local function rawMul(s1: number, l1: number, s2: number, l2: number): (number, number)
+	if s1 ~= 0 and s2 ~= 0 and l1 == l1 and l2 == l2 and l1 < math.huge and l2 < math.huge then
+		local resultLog = l1 + l2
+		if resultLog == -math.huge then return 0, 0 end
+		return s1 * s2, resultLog
+	end
+
+	local resultLog = l1 + l2
+	if resultLog ~= resultLog then return 0, 0 / 0 end
+	if s1 == 0 or s2 == 0 then
+		if resultLog == math.huge then return 0, 0 / 0 end
+		return 0, 0
+	end
+	if resultLog == -math.huge then return 0, 0 end
+	return s1 * s2, resultLog
+end
+
+local function rawDiv(s1: number, l1: number, s2: number, l2: number): (number, number)
+	if s1 ~= 0 and s2 ~= 0 and l1 == l1 and l2 == l2 and l1 < math.huge and l2 < math.huge then
+		local resultLog = l1 - l2
+		if resultLog == -math.huge then return 0, 0 end
+		return s1 * s2, resultLog
+	end
+
+	local resultLog = l1 - l2
+	if resultLog ~= resultLog then return 0, 0 / 0 end
+	if s2 == 0 then
+		if s1 == 0 then return 0, 0 / 0 end
+		return s1, math.huge
+	end
+	if s1 == 0 or resultLog == -math.huge then return 0, 0 end
+	return s1 * s2, resultLog
+end
+
+local function rawCompare(s1: number, l1: number, s2: number, l2: number): number?
+	if l1 ~= l1 or l2 ~= l2 then return nil end
+	if s1 < s2 then return -1 end
+	if s1 > s2 then return 1 end
+	if s1 == 0 then return 0 end
+	if l1 == l2 then return 0 end
+	if s1 > 0 then return if l1 < l2 then -1 else 1 end
+	return if l1 > l2 then -1 else 1
+end
+
+--[[
+Adds two canonical Bnums.
+
+Fast path:
+- same-sign finite values stay inline,
+- distant magnitudes return the dominant operand immediately.
+
+Hard path:
+- mixed signs, cancellation, zero, NaN, and infinities use rawAddHard().
+
+Example: 1 + 1 -> 2.
 ]]
 function Bnum.add(val1: Value, val2: Value): Value
 	local s1 = val1[1]
@@ -614,114 +837,29 @@ function Bnum.add(val1: Value, val2: Value): Value
 	local s2 = val2[1]
 	local l2 = val2[2]
 
-	if l1 ~= l1 or l2 ~= l2 then
-		return {0, 0 / 0}
+	if s1 == s2 and s1 ~= 0 and l1 == l1 and l2 == l2 and l1 < math.huge and l2 < math.huge then
+		if l1 == l2 then return {s1, l1 + LOG10_2} end
+
+		local hi = l1
+		local lo = l2
+		if lo > hi then hi, lo = lo, hi end
+
+		local delta = lo - hi
+		if delta < ADD_CUTOFF then return {s1, hi} end
+		return {s1, hi + math.log10(1 + math.exp(delta * LN10))}
 	end
 
-	if s1 == 0 then
-		return {s2, l2}
-	end
-
-	if s2 == 0 then
-		return {s1, l1}
-	end
-
-	if s1 == s2 then
-		if l1 == l2 then
-			return {s1, l1 + LOG10_2}
-		end
-
-		if l1 >= l2 then
-			if l1 == math.huge then
-				return {s1, l1}
-			end
-
-			local delta = l2 - l1
-
-			if delta < ADD_CUTOFF then
-				return {s1, l1}
-			end
-
-			return {s1, l1 + math.log10(1 + math.exp(delta * LN10))}
-		end
-
-		if l2 == math.huge then
-			return {s1, l2}
-		end
-
-		local delta = l1 - l2
-
-		if delta < ADD_CUTOFF then
-			return {s1, l2}
-		end
-
-		return {s1, l2 + math.log10(1 + math.exp(delta * LN10))}
-	end
-
-	if l1 == l2 then
-		if l1 == math.huge then
-			return {0, 0 / 0}
-		end
-
-		return {0, 0}
-	end
-
-	if l1 > l2 then
-		local delta = l2 - l1
-
-		if delta < ADD_CUTOFF then
-			return {s1, l1}
-		end
-
-		local difference
-
-		if delta > CLOSE_CANCEL then
-			if delta > -1e-300 then
-				return {s1, l1 + (math.log10(-delta) + LOG10_LN10)}
-			end
-
-			local x = -delta * LN10
-			difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-		else
-			difference = 1 - math.exp(delta * LN10)
-		end
-
-		if difference <= 0 then
-			return {0, 0}
-		end
-
-		return {s1, l1 + math.log10(difference)}
-	end
-
-	local delta = l1 - l2
-
-	if delta < ADD_CUTOFF then
-		return {s2, l2}
-	end
-
-	local difference
-
-	if delta > CLOSE_CANCEL then
-		if delta > -1e-300 then
-			return {s2, l2 + (math.log10(-delta) + LOG10_LN10)}
-		end
-
-		local x = -delta * LN10
-		difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-	else
-		difference = 1 - math.exp(delta * LN10)
-	end
-
-	if difference <= 0 then
-		return {0, 0}
-	end
-
-	return {s2, l2 + math.log10(difference)}
+	local sign, logMagnitude = rawAddHard(s1, l1, s2, l2)
+	return {sign, logMagnitude}
 end
 
 --[[
-Subtracts the second Bnum from the first using direct log-space arithmetic.
-Example: 5 - 2 -> 3
+Subtracts the second Bnum from the first.
+
+The common same-effective-sign finite path stays inline. Mixed-sign and close
+cancellation cases are handled by the private raw hard-path kernel.
+
+Example: 5 - 2 -> 3.
 ]]
 function Bnum.sub(val1: Value, val2: Value): Value
 	local s1 = val1[1]
@@ -729,470 +867,213 @@ function Bnum.sub(val1: Value, val2: Value): Value
 	local s2 = -val2[1]
 	local l2 = val2[2]
 
-	if l1 ~= l1 or l2 ~= l2 then
-		return {0, 0 / 0}
+	if s1 == s2 and s1 ~= 0 and l1 == l1 and l2 == l2 and l1 < math.huge and l2 < math.huge then
+		if l1 == l2 then return {s1, l1 + LOG10_2} end
+
+		local hi = l1
+		local lo = l2
+		if lo > hi then hi, lo = lo, hi end
+
+		local delta = lo - hi
+		if delta < ADD_CUTOFF then return {s1, hi} end
+		return {s1, hi + math.log10(1 + math.exp(delta * LN10))}
 	end
 
-	if s1 == 0 then
-		return {s2, l2}
-	end
-
-	if s2 == 0 then
-		return {s1, l1}
-	end
-
-	if s1 == s2 then
-		if l1 == l2 then
-			return {s1, l1 + LOG10_2}
-		end
-
-		if l2 > l1 then
-			l1, l2 = l2, l1
-		end
-
-		if l1 == math.huge then
-			return {s1, l1}
-		end
-
-		local delta = l2 - l1
-
-		if delta < ADD_CUTOFF then
-			return {s1, l1}
-		end
-
-		return {s1, l1 + math.log10(1 + math.exp(delta * LN10))}
-	end
-
-	if l1 == l2 then
-		if l1 == math.huge then
-			return {0, 0 / 0}
-		end
-
-		return {0, 0}
-	end
-
-	if l1 > l2 then
-		local delta = l2 - l1
-
-		if delta < ADD_CUTOFF then
-			return {s1, l1}
-		end
-
-		local difference
-
-		if delta > CLOSE_CANCEL then
-			if delta > -1e-300 then
-				return {s1, l1 + (math.log10(-delta) + LOG10_LN10)}
-			end
-
-			local x = -delta * LN10
-			difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-		else
-			difference = 1 - math.exp(delta * LN10)
-		end
-
-		if difference <= 0 then
-			return {0, 0}
-		end
-
-		return {s1, l1 + math.log10(difference)}
-	end
-
-	local delta = l1 - l2
-
-	if delta < ADD_CUTOFF then
-		return {s2, l2}
-	end
-
-	local difference
-
-	if delta > CLOSE_CANCEL then
-		if delta > -1e-300 then
-			return {s2, l2 + (math.log10(-delta) + LOG10_LN10)}
-		end
-
-		local x = -delta * LN10
-		difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-	else
-		difference = 1 - math.exp(delta * LN10)
-	end
-
-	if difference <= 0 then
-		return {0, 0}
-	end
-
-	return {s2, l2 + math.log10(difference)}
+	local sign, logMagnitude = rawAddHard(s1, l1, s2, l2)
+	return {sign, logMagnitude}
 end
 
 --[[
-Multiplies two Bnums by multiplying signs and adding log magnitudes.
-Example: 10 × 100 -> 1000
+Multiplies two Bnums.
+
+Fast path:
+finite nonzero operands multiply signs and add log magnitudes directly.
+
+Hard path:
+zero, NaN, infinity, and underflow edge cases are resolved without creating
+temporary values.
+
+Example: 10 × 100 -> 1000.
 ]]
 function Bnum.mul(val1: Value, val2: Value): Value
 	local s1 = val1[1]
+	local l1 = val1[2]
 	local s2 = val2[1]
-	local logMagnitude = val1[2] + val2[2]
+	local l2 = val2[2]
 
-	if logMagnitude ~= logMagnitude then
-		return {0, 0 / 0}
+	if s1 ~= 0 and s2 ~= 0 and l1 == l1 and l2 == l2 and l1 < math.huge and l2 < math.huge then
+		local resultLog = l1 + l2
+		if resultLog == -math.huge then return {0, 0} end
+		return {s1 * s2, resultLog}
 	end
 
-	if s1 == 0 or s2 == 0 then
-		if logMagnitude == math.huge then
-			return {0, 0 / 0}
-		end
-
-		return {0, 0}
-	end
-
-	if logMagnitude == -math.huge then
-		return {0, 0}
-	end
-
-	return {s1 * s2, logMagnitude}
+	local sign, logMagnitude = rawMul(s1, l1, s2, l2)
+	return {sign, logMagnitude}
 end
 
 --[[
-Divides the first Bnum by the second using direct log-space arithmetic.
-Example: 1000 / 10 -> 100
+Divides the first Bnum by the second.
+
+Fast path:
+finite nonzero operands multiply signs and subtract log magnitudes.
+
+Hard path:
+division by zero, zero numerators, infinities, NaN, and underflow are handled
+by the raw division kernel.
+
+Example: 1000 / 10 -> 100.
 ]]
 function Bnum.div(val1: Value, val2: Value): Value
 	local s1 = val1[1]
+	local l1 = val1[2]
 	local s2 = val2[1]
-	local logMagnitude = val1[2] - val2[2]
+	local l2 = val2[2]
 
-	if logMagnitude ~= logMagnitude then
-		return {0, 0 / 0}
+	if s1 ~= 0 and s2 ~= 0 and l1 == l1 and l2 == l2 and l1 < math.huge and l2 < math.huge then
+		local resultLog = l1 - l2
+		if resultLog == -math.huge then return {0, 0} end
+		return {s1 * s2, resultLog}
 	end
 
-	if s2 == 0 then
-		if s1 == 0 then
-			return {0, 0 / 0}
-		end
-
-		return {s1, math.huge}
-	end
-
-	if s1 == 0 or logMagnitude == -math.huge then
-		return {0, 0}
-	end
-
-	return {s1 * s2, logMagnitude}
+	local sign, logMagnitude = rawDiv(s1, l1, s2, l2)
+	return {sign, logMagnitude}
 end
 
 --[[
-Adds a normal Luau number directly to a Bnum without creating a temporary Bnum.
-Example: 100 + 25 -> 125
+Adds a normal Luau number directly to a Bnum.
+
+Fast path converts only the scalar's sign/log and keeps ordinary same-sign
+addition inline. Hard cases reuse rawAddHard().
+
+Example: 100 + 25 -> 125.
 ]]
 function Bnum.addNumber(val: Value, n: number): Value
 	local s1 = val[1]
 	local l1 = val[2]
 
-	if n ~= n then
-		return {0, 0 / 0}
-	end
-
-	if n == 0 then
-		return {s1, l1}
-	end
+	if n ~= n then return {0, 0 / 0} end
+	if n == 0 then return {s1, l1} end
 
 	local s2 = math.sign(n)
 	local l2 = math.log10(if n < 0 then -n else n)
 
-	if l1 ~= l1 or l2 ~= l2 then
-		return {0, 0 / 0}
+	if s1 == s2 and s1 ~= 0 and l1 == l1 and l1 < math.huge and l2 < math.huge then
+		if l1 == l2 then return {s1, l1 + LOG10_2} end
+
+		local hi = l1
+		local lo = l2
+		if lo > hi then hi, lo = lo, hi end
+
+		local delta = lo - hi
+		if delta < ADD_CUTOFF then return {s1, hi} end
+		return {s1, hi + math.log10(1 + math.exp(delta * LN10))}
 	end
 
-	if s1 == 0 then
-		return {s2, l2}
-	end
-
-	if s2 == 0 then
-		return {s1, l1}
-	end
-
-	if s1 == s2 then
-		if l1 == l2 then
-			return {s1, l1 + LOG10_2}
-		end
-
-		if l1 >= l2 then
-			if l1 == math.huge then
-				return {s1, l1}
-			end
-
-			local delta = l2 - l1
-
-			if delta < ADD_CUTOFF then
-				return {s1, l1}
-			end
-
-			return {s1, l1 + math.log10(1 + math.exp(delta * LN10))}
-		end
-
-		if l2 == math.huge then
-			return {s1, l2}
-		end
-
-		local delta = l1 - l2
-
-		if delta < ADD_CUTOFF then
-			return {s1, l2}
-		end
-
-		return {s1, l2 + math.log10(1 + math.exp(delta * LN10))}
-	end
-
-	if l1 == l2 then
-		if l1 == math.huge then
-			return {0, 0 / 0}
-		end
-
-		return {0, 0}
-	end
-
-	if l1 > l2 then
-		local delta = l2 - l1
-
-		if delta < ADD_CUTOFF then
-			return {s1, l1}
-		end
-
-		local difference
-
-		if delta > CLOSE_CANCEL then
-			if delta > -1e-300 then
-				return {s1, l1 + (math.log10(-delta) + LOG10_LN10)}
-			end
-
-			local x = -delta * LN10
-			difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-		else
-			difference = 1 - math.exp(delta * LN10)
-		end
-
-		if difference <= 0 then
-			return {0, 0}
-		end
-
-		return {s1, l1 + math.log10(difference)}
-	end
-
-	local delta = l1 - l2
-
-	if delta < ADD_CUTOFF then
-		return {s2, l2}
-	end
-
-	local difference
-
-	if delta > CLOSE_CANCEL then
-		if delta > -1e-300 then
-			return {s2, l2 + (math.log10(-delta) + LOG10_LN10)}
-		end
-
-		local x = -delta * LN10
-		difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-	else
-		difference = 1 - math.exp(delta * LN10)
-	end
-
-	if difference <= 0 then
-		return {0, 0}
-	end
-
-	return {s2, l2 + math.log10(difference)}
+	local sign, logMagnitude = rawAddHard(s1, l1, s2, l2)
+	return {sign, logMagnitude}
 end
 
 --[[
 Subtracts a normal Luau number directly from a Bnum.
-Example: 100 - 25 -> 75
+
+The scalar is converted to sign/log form once. Common finite cases stay inline;
+mixed-sign and cancellation cases use the raw hard-path kernel.
+
+Example: 100 - 25 -> 75.
 ]]
 function Bnum.subNumber(val: Value, n: number): Value
 	local s1 = val[1]
 	local l1 = val[2]
 
-	if n ~= n then
-		return {0, 0 / 0}
-	end
-
-	if n == 0 then
-		return {s1, l1}
-	end
+	if n ~= n then return {0, 0 / 0} end
+	if n == 0 then return {s1, l1} end
 
 	local s2 = -math.sign(n)
 	local l2 = math.log10(if n < 0 then -n else n)
 
-	if l1 ~= l1 or l2 ~= l2 then
-		return {0, 0 / 0}
+	if s1 == s2 and s1 ~= 0 and l1 == l1 and l1 < math.huge and l2 < math.huge then
+		if l1 == l2 then return {s1, l1 + LOG10_2} end
+
+		local hi = l1
+		local lo = l2
+		if lo > hi then hi, lo = lo, hi end
+
+		local delta = lo - hi
+		if delta < ADD_CUTOFF then return {s1, hi} end
+		return {s1, hi + math.log10(1 + math.exp(delta * LN10))}
 	end
 
-	if s1 == 0 then
-		return {s2, l2}
-	end
-
-	if s2 == 0 then
-		return {s1, l1}
-	end
-
-	if s1 == s2 then
-		if l1 == l2 then
-			return {s1, l1 + LOG10_2}
-		end
-
-		if l2 > l1 then
-			l1, l2 = l2, l1
-		end
-
-		if l1 == math.huge then
-			return {s1, l1}
-		end
-
-		local delta = l2 - l1
-
-		if delta < ADD_CUTOFF then
-			return {s1, l1}
-		end
-
-		return {s1, l1 + math.log10(1 + math.exp(delta * LN10))}
-	end
-
-	if l1 == l2 then
-		if l1 == math.huge then
-			return {0, 0 / 0}
-		end
-
-		return {0, 0}
-	end
-
-	if l1 > l2 then
-		local delta = l2 - l1
-
-		if delta < ADD_CUTOFF then
-			return {s1, l1}
-		end
-
-		local difference
-
-		if delta > CLOSE_CANCEL then
-			if delta > -1e-300 then
-				return {s1, l1 + (math.log10(-delta) + LOG10_LN10)}
-			end
-
-			local x = -delta * LN10
-			difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-		else
-			difference = 1 - math.exp(delta * LN10)
-		end
-
-		if difference <= 0 then
-			return {0, 0}
-		end
-
-		return {s1, l1 + math.log10(difference)}
-	end
-
-	local delta = l1 - l2
-
-	if delta < ADD_CUTOFF then
-		return {s2, l2}
-	end
-
-	local difference
-
-	if delta > CLOSE_CANCEL then
-		if delta > -1e-300 then
-			return {s2, l2 + (math.log10(-delta) + LOG10_LN10)}
-		end
-
-		local x = -delta * LN10
-		difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-	else
-		difference = 1 - math.exp(delta * LN10)
-	end
-
-	if difference <= 0 then
-		return {0, 0}
-	end
-
-	return {s2, l2 + math.log10(difference)}
+	local sign, logMagnitude = rawAddHard(s1, l1, s2, l2)
+	return {sign, logMagnitude}
 end
 
 --[[
-Multiplies a Bnum directly by a normal Luau number.
-Example: 100 × 1.5 -> 150
+Multiplies a Bnum by a normal number without allocating a temporary Bnum.
+
+The finite nonzero case is one sign branch, one log10, and one log addition.
+Special zero/infinity/NaN behavior stays on the hard path.
+
+Example: 100 × 1.5 -> 150.
 ]]
 function Bnum.mulNumber(val: Value, n: number): Value
-	local s1 = val[1]
-	local l1 = val[2]
+	local sign = val[1]
+	local logMagnitude = val[2]
 
-	if l1 ~= l1 or n ~= n then
-		return {0, 0 / 0}
+	if sign ~= 0 and logMagnitude == logMagnitude and logMagnitude < math.huge and n ~= 0 and n == n and n > -math.huge and n < math.huge then
+		local resultSign = if n < 0 then -sign else sign
+		local resultLog = logMagnitude + math.log10(if n < 0 then -n else n)
+		if resultLog == -math.huge then return {0, 0} end
+		return {resultSign, resultLog}
 	end
 
+	if logMagnitude ~= logMagnitude or n ~= n then return {0, 0 / 0} end
 	if n == 0 then
-		if s1 ~= 0 and l1 == math.huge then
-			return {0, 0 / 0}
-		end
+		if sign ~= 0 and logMagnitude == math.huge then return {0, 0 / 0} end
+		return {0, 0}
+	end
+	if sign == 0 then
+		if n == math.huge or n == -math.huge then return {0, 0 / 0} end
 		return {0, 0}
 	end
 
-	if s1 == 0 then
-		if n == math.huge or n == -math.huge then
-			return {0, 0 / 0}
-		end
-		return {0, 0}
-	end
-
-	local sign = if n < 0 then -s1 else s1
-	local logMagnitude = l1 + math.log10(if n < 0 then -n else n)
-
-	if logMagnitude ~= logMagnitude then
-		return {0, 0 / 0}
-	end
-
-	if logMagnitude == -math.huge then
-		return {0, 0}
-	end
-
-	return {sign, logMagnitude}
+	local resultSign = if n < 0 then -sign else sign
+	local resultLog = logMagnitude + math.log10(if n < 0 then -n else n)
+	if resultLog ~= resultLog then return {0, 0 / 0} end
+	if resultLog == -math.huge then return {0, 0} end
+	return {resultSign, resultLog}
 end
 
 --[[
-Divides a Bnum directly by a normal Luau number.
-Example: 100 / 4 -> 25
+Divides a Bnum by a normal number without allocating a temporary Bnum.
+
+The finite nonzero case is direct sign handling plus one logarithm/subtraction.
+Division-by-zero and special values remain on the hard path.
+
+Example: 100 / 4 -> 25.
 ]]
 function Bnum.divNumber(val: Value, n: number): Value
-	local s1 = val[1]
-	local l1 = val[2]
+	local sign = val[1]
+	local logMagnitude = val[2]
 
-	if l1 ~= l1 or n ~= n then
-		return {0, 0 / 0}
+	if sign ~= 0 and logMagnitude == logMagnitude and logMagnitude < math.huge and n ~= 0 and n == n and n > -math.huge and n < math.huge then
+		local resultSign = if n < 0 then -sign else sign
+		local resultLog = logMagnitude - math.log10(if n < 0 then -n else n)
+		if resultLog == -math.huge then return {0, 0} end
+		return {resultSign, resultLog}
 	end
 
+	if logMagnitude ~= logMagnitude or n ~= n then return {0, 0 / 0} end
 	if n == 0 then
-		if s1 == 0 then
-			return {0, 0 / 0}
-		end
-		return {s1, math.huge}
+		if sign == 0 then return {0, 0 / 0} end
+		return {sign, math.huge}
 	end
+	if sign == 0 then return {0, 0} end
 
-	if s1 == 0 then
-		return {0, 0}
-	end
-
-	local sign = if n < 0 then -s1 else s1
-	local logMagnitude = l1 - math.log10(if n < 0 then -n else n)
-
-	if logMagnitude ~= logMagnitude then
-		return {0, 0 / 0}
-	end
-
-	if logMagnitude == -math.huge then
-		return {0, 0}
-	end
-
-	return {sign, logMagnitude}
+	local resultSign = if n < 0 then -sign else sign
+	local resultLog = logMagnitude - math.log10(if n < 0 then -n else n)
+	if resultLog ~= resultLog then return {0, 0 / 0} end
+	if resultLog == -math.huge then return {0, 0} end
+	return {resultSign, resultLog}
 end
 
 --[[
@@ -1944,50 +1825,126 @@ function Bnum.factorial(val: Value): Value
 end
 
 --==============================================================
+-- Specialized math helpers
+--==============================================================
+
+--[[
+Raises a Bnum to an integer power.
+
+This path skips fractional-power validation and restores the sign using parity.
+It is useful for repeated simulator formulas where the exponent is known to be
+an integer.
+
+Examples:
+powInteger(-2, 3) -> -8
+powInteger(-2, 4) -> 16
+]]
+function Bnum.powInteger(val: Value, power: number): Value
+	local sign = val[1]
+	local logMagnitude = val[2]
+
+	if power ~= power or power == math.huge or power == -math.huge or power % 1 ~= 0 or logMagnitude ~= logMagnitude then return {0, 0 / 0} end
+	if power == 0 then return {1, 0} end
+	if sign == 0 then return if power > 0 then {0, 0} else {1, math.huge} end
+	if sign < 0 and math.abs(power) > MAX_EXACT_INTEGER then return {0, 0 / 0} end
+
+	local resultLog = logMagnitude * power
+	if resultLog ~= resultLog then return {0, 0 / 0} end
+	if resultLog == -math.huge then return {0, 0} end
+
+	local resultSign = if sign < 0 and power % 2 ~= 0 then -1 else 1
+	return {resultSign, resultLog}
+end
+
+--[[
+Returns the arithmetic midpoint `(a + b) / 2`.
+
+This avoids the more general lerp path and performs one raw addition followed by
+a fixed log10(2) subtraction.
+]]
+function Bnum.midpoint(a: Value, b: Value): Value
+	local sign, logMagnitude = rawAdd(a[1], a[2], b[1], b[2])
+	if logMagnitude ~= logMagnitude or sign == 0 then return {sign, logMagnitude} end
+	return {sign, logMagnitude - LOG10_2}
+end
+
+--[[
+Returns the real geometric mean `sqrt(a * b)`.
+
+Both inputs must be non-negative. For positive finite values the result is just
+the average of the two stored log magnitudes.
+]]
+function Bnum.geometricMean(a: Value, b: Value): Value
+	local as = a[1]
+	local al = a[2]
+	local bs = b[1]
+	local bl = b[2]
+
+	if al ~= al or bl ~= bl or as < 0 or bs < 0 then return {0, 0 / 0} end
+	if as == 0 or bs == 0 then return {0, 0} end
+	if al == math.huge or bl == math.huge then return {1, math.huge} end
+
+	return {1, (al + bl) * 0.5}
+end
+
+--[[
+Returns the quadratic mean / RMS of two Bnums:
+
+sqrt((a² + b²) / 2)
+
+The implementation is stable in log space and does not square the represented
+native values directly.
+]]
+function Bnum.quadraticMean(a: Value, b: Value): Value
+	local as = a[1]
+	local al = a[2]
+	local bs = b[1]
+	local bl = b[2]
+
+	if al ~= al or bl ~= bl then return {0, 0 / 0} end
+	if as == 0 and bs == 0 then return {0, 0} end
+	if al == math.huge or bl == math.huge then return {1, math.huge} end
+
+	local a2S = if as == 0 then 0 else 1
+	local b2S = if bs == 0 then 0 else 1
+	local a2L = al * 2
+	local b2L = bl * 2
+	local sumS, sumL = rawAdd(a2S, a2L, b2S, b2L)
+
+	if sumL ~= sumL or sumS == 0 then return {sumS, sumL} end
+	return {1, (sumL - LOG10_2) * 0.5}
+end
+
+--[[
+Clamps a Bnum to the inclusive range [0, 1].
+
+This is a common game-math fast helper for progress values, normalized ratios,
+UI fills, and interpolation parameters.
+]]
+function Bnum.saturate(val: Value): Value
+	local sign = val[1]
+	local logMagnitude = val[2]
+
+	if logMagnitude ~= logMagnitude then return {0, 0 / 0} end
+	if sign <= 0 then return {0, 0} end
+	if logMagnitude >= 0 then return {1, 0} end
+	return {1, logMagnitude}
+end
+
+--==============================================================
 -- Comparison
 --==============================================================
 
 --[[
 Compares two Bnums and returns -1, 0, or 1.
-Example: 2 compared with 5 -> -1
+
+The comparison works directly on sign and logMagnitude and allocates nothing.
+NaN is unordered and returns nil.
+
+Example: compare(10, 25) -> -1.
 ]]
 function Bnum.compare(val1: Value, val2: Value): number?
-	local s1 = val1[1]
-	local l1 = val1[2]
-	local s2 = val2[1]
-	local l2 = val2[2]
-
-	if l1 ~= l1 or l2 ~= l2 then
-		return nil
-	end
-
-	if s1 < s2 then
-		return -1
-	end
-
-	if s1 > s2 then
-		return 1
-	end
-
-	if s1 == 0 then
-		return 0
-	end
-
-	if s1 > 0 then
-		if l1 < l2 then
-			return -1
-		elseif l1 > l2 then
-			return 1
-		end
-	else
-		if l1 > l2 then
-			return -1
-		elseif l1 < l2 then
-			return 1
-		end
-	end
-
-	return 0
+	return rawCompare(val1[1], val1[2], val2[1], val2[2])
 end
 
 --[[
@@ -2174,41 +2131,26 @@ function Bnum.max(val1: Value, val2: Value?, ...: Value): Value
 end
 
 --[[
-Clamps a Bnum between a minimum and maximum value.
-Example: clamp(15, 0, 10) -> 10
+Clamps a Bnum between minimum and maximum.
+
+The function compares raw canonical fields directly, so it does not allocate
+temporary comparison values. Inverted bounds return NaN.
+
+Example: clamp(150, 0, 100) -> 100.
 ]]
 function Bnum.clamp(val: Value, minimum: Value, maximum: Value): Value
-	local s = val[1]
-	local l = val[2]
-	local minS = minimum[1]
-	local minL = minimum[2]
-	local maxS = maximum[1]
-	local maxL = maximum[2]
-	if l ~= l or minL ~= minL or maxL ~= maxL then
-		return {0, 0 / 0}
-	end
+	local minVsMax = rawCompare(minimum[1], minimum[2], maximum[1], maximum[2])
+	if minVsMax == nil or minVsMax > 0 then return {0, 0 / 0} end
 
-	local inverted
-	if minS ~= maxS then
-		inverted = minS > maxS
-	elseif minS == 0 then
-		inverted = false
-	elseif minS > 0 then
-		inverted = minL > maxL
-	else
-		inverted = minL < maxL
-	end
-	if inverted then
-		return {0, 0 / 0}
-	end
+	local vsMin = rawCompare(val[1], val[2], minimum[1], minimum[2])
+	if vsMin == nil then return {0, 0 / 0} end
+	if vsMin < 0 then return {minimum[1], minimum[2]} end
 
-	if s < minS or (s == minS and s ~= 0 and ((s > 0 and l < minL) or (s < 0 and l > minL))) then
-		return {minS, minL}
-	end
-	if s > maxS or (s == maxS and s ~= 0 and ((s > 0 and l > maxL) or (s < 0 and l < maxL))) then
-		return {maxS, maxL}
-	end
-	return {s, l}
+	local vsMax = rawCompare(val[1], val[2], maximum[1], maximum[2])
+	if vsMax == nil then return {0, 0 / 0} end
+	if vsMax > 0 then return {maximum[1], maximum[2]} end
+
+	return {val[1], val[2]}
 end
 
 --[[
@@ -2535,1305 +2477,181 @@ function Bnum.distance(a: Value, b: Value): Value
 end
 
 --[[
-Returns the absolute difference relative to the larger absolute input.
-Example: 100 vs 90 -> 0.1
+Returns |a - b| / max(|a|, |b|).
+
+The subtraction and division operate on raw sign/log pairs, avoiding temporary
+Bnum allocations.
+
+Equal values return zero. Two zeros also return zero.
 ]]
 function Bnum.relativeDifference(a: Value, b: Value): Value
 	local as = a[1]
 	local al = a[2]
 	local bs = b[1]
 	local bl = b[2]
-	if as == bs and al == bl then
-		return {0, 0}
-	end
-	if al ~= al or bl ~= bl then
-		return {0, 0 / 0}
-	end
 
-	local s1 = as
-	local l1 = al
-	local s2 = -bs
-	local l2 = bl
-	local differenceSign
-	local differenceLog
-	if l1 ~= l1 or l2 ~= l2 then
-		differenceSign = 0
-		differenceLog = 0 / 0
-	elseif s1 == 0 then
-		differenceSign = s2
-		differenceLog = l2
-	elseif s2 == 0 then
-		differenceSign = s1
-		differenceLog = l1
-	elseif s1 == s2 then
-		differenceSign = s1
-		if l1 == l2 then
-			differenceLog = l1 + LOG10_2
-		elseif l1 >= l2 then
-			if l1 == math.huge then
-				differenceLog = l1
-			else
-				local delta = l2 - l1
-				if delta < ADD_CUTOFF then
-					differenceLog = l1
-				else
-					differenceLog = l1 + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if l2 == math.huge then
-				differenceLog = l2
-			else
-				local delta = l1 - l2
-				if delta < ADD_CUTOFF then
-					differenceLog = l2
-				else
-					differenceLog = l2 + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if l1 == l2 then
-			if l1 == math.huge then
-				differenceSign = 0
-				differenceLog = 0 / 0
-			else
-				differenceSign = 0
-				differenceLog = 0
-			end
-		elseif l1 > l2 then
-			differenceSign = s1
-			local delta = l2 - l1
-			if delta < ADD_CUTOFF then
-				differenceLog = l1
-			elseif delta > -1e-300 then
-				differenceLog = l1 + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					differenceSign = 0
-					differenceLog = 0
-				else
-					differenceLog = l1 + math.log10(difference)
-				end
-			end
-		else
-			differenceSign = s2
-			local delta = l1 - l2
-			if delta < ADD_CUTOFF then
-				differenceLog = l2
-			elseif delta > -1e-300 then
-				differenceLog = l2 + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					differenceSign = 0
-					differenceLog = 0
-				else
-					differenceLog = l2 + math.log10(difference)
-				end
-			end
-		end
-	end
-	if differenceLog ~= differenceLog then
-		return {0, 0 / 0}
-	end
-	if differenceSign == 0 then
-		return {0, 0}
-	end
+	if al ~= al or bl ~= bl then return {0, 0 / 0} end
+	if as == bs and al == bl then return {0, 0} end
 
-	local scaleLog
-	if as == 0 then
-		scaleLog = bl
-	elseif bs == 0 then
-		scaleLog = al
-	elseif al >= bl then
-		scaleLog = al
-	else
-		scaleLog = bl
-	end
-	if scaleLog == nil then
-		return {0, 0}
-	end
+	local ds, dl = rawAdd(as, al, -bs, bl)
+	if dl ~= dl then return {0, 0 / 0} end
+	if ds == 0 then return {0, 0} end
+	if ds < 0 then ds = 1 end
 
-	local resultLog = differenceLog - scaleLog
-	if resultLog ~= resultLog then
-		return {0, 0 / 0}
+	local maxSign = 0
+	local maxLog = 0
+	if as ~= 0 then
+		maxSign = 1
+		maxLog = al
 	end
-	if resultLog == -math.huge then
-		return {0, 0}
+	if bs ~= 0 and (maxSign == 0 or bl > maxLog) then
+		maxSign = 1
+		maxLog = bl
 	end
-	return {1, resultLog}
+	if maxSign == 0 then return {0, 0} end
+
+	local rs, rl = rawDiv(1, dl, 1, maxLog)
+	return {rs, rl}
 end
 
 --[[
-Checks approximate equality using relative and absolute tolerances.
-Example: 1 and 1.000000001 -> tolerance-dependent
+Checks approximate equality with relative and absolute tolerances.
+
+Fast path:
+identical canonical values return immediately.
+
+General path:
+computes |a-b| once in raw log space, checks absolute tolerance, then compares
+against relTolerance * max(|a|, |b|). No temporary Bnum tables are created.
 ]]
 function Bnum.approxEq(a: Value, b: Value, relTolerance: number?, absTolerance: number?): boolean
 	local as = a[1]
 	local al = a[2]
 	local bs = b[1]
 	local bl = b[2]
-	if as == bs and al == bl then
-		return true
-	end
-	if al ~= al or bl ~= bl then
-		return false
-	end
-	if al == math.huge or bl == math.huge then
-		return false
-	end
 
-	local absTol = absTolerance or 0
+	if as == bs and al == bl then return true end
+	if al ~= al or bl ~= bl or al == math.huge or bl == math.huge then return false end
+
 	local relTol = relTolerance or 1e-12
-	if absTol ~= absTol or relTol ~= relTol or absTol < 0 or relTol < 0 then
-		return false
-	end
+	local absTol = absTolerance or 0
+	if relTol ~= relTol or absTol ~= absTol or relTol < 0 or absTol < 0 then return false end
 
-	local s1 = as
-	local l1 = al
-	local s2 = -bs
-	local l2 = bl
-	local differenceSign
-	local differenceLog
-	if l1 ~= l1 or l2 ~= l2 then
-		differenceSign = 0
-		differenceLog = 0 / 0
-	elseif s1 == 0 then
-		differenceSign = s2
-		differenceLog = l2
-	elseif s2 == 0 then
-		differenceSign = s1
-		differenceLog = l1
-	elseif s1 == s2 then
-		differenceSign = s1
-		if l1 == l2 then
-			differenceLog = l1 + LOG10_2
-		elseif l1 >= l2 then
-			if l1 == math.huge then
-				differenceLog = l1
-			else
-				local delta = l2 - l1
-				if delta < ADD_CUTOFF then
-					differenceLog = l1
-				else
-					differenceLog = l1 + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if l2 == math.huge then
-				differenceLog = l2
-			else
-				local delta = l1 - l2
-				if delta < ADD_CUTOFF then
-					differenceLog = l2
-				else
-					differenceLog = l2 + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if l1 == l2 then
-			if l1 == math.huge then
-				differenceSign = 0
-				differenceLog = 0 / 0
-			else
-				differenceSign = 0
-				differenceLog = 0
-			end
-		elseif l1 > l2 then
-			differenceSign = s1
-			local delta = l2 - l1
-			if delta < ADD_CUTOFF then
-				differenceLog = l1
-			elseif delta > -1e-300 then
-				differenceLog = l1 + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					differenceSign = 0
-					differenceLog = 0
-				else
-					differenceLog = l1 + math.log10(difference)
-				end
-			end
-		else
-			differenceSign = s2
-			local delta = l1 - l2
-			if delta < ADD_CUTOFF then
-				differenceLog = l2
-			elseif delta > -1e-300 then
-				differenceLog = l2 + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					differenceSign = 0
-					differenceLog = 0
-				else
-					differenceLog = l2 + math.log10(difference)
-				end
-			end
-		end
-	end
-	if differenceLog ~= differenceLog then
-		return false
-	end
-	if differenceSign == 0 then
-		return true
-	end
+	local ds, dl = rawAdd(as, al, -bs, bl)
+	if dl ~= dl then return false end
+	if ds == 0 then return true end
+	if ds < 0 then ds = 1 end
 
 	if absTol > 0 then
 		local absTolLog = math.log10(absTol)
-		if differenceLog <= absTolLog then
-			return true
-		end
+		if dl <= absTolLog then return true end
 	end
 
-	local scaleLog
+	if relTol == 0 then return false end
+
+	local maxLog
 	if as == 0 then
-		scaleLog = bl
+		maxLog = bl
 	elseif bs == 0 then
-		scaleLog = al
-	elseif al >= bl then
-		scaleLog = al
+		maxLog = al
 	else
-		scaleLog = bl
+		maxLog = if al > bl then al else bl
 	end
-	if scaleLog == nil then
-		return true
-	end
-	if relTol == 0 then
-		return false
-	end
-	if relTol == math.huge then
-		return true
-	end
-	local thresholdLog = scaleLog + math.log10(relTol)
-	return differenceLog <= thresholdLog
+
+	if maxLog == math.huge then return false end
+	return dl <= maxLog + math.log10(relTol)
 end
 
 --[[
-Linearly interpolates between two Bnums using a normal numeric alpha.
-Example: lerp(0, 10, 0.5) -> 5
+Linearly interpolates between two Bnums:
+
+a + (b - a) * alpha
+
+Fast exits handle alpha 0/1 and identical endpoints. The general path uses raw
+subtraction/scaling/addition and allocates only the final result table.
 ]]
 function Bnum.lerp(a: Value, b: Value, alpha: number): Value
-	if alpha ~= alpha then
-		return {0, 0 / 0}
-	end
-	local as = a[1]
-	local al = a[2]
-	local bs = b[1]
-	local bl = b[2]
-	if alpha == 0 then
-		return {as, al}
-	end
-	if alpha == 1 then
-		return {bs, bl}
-	end
-	if as == bs and al == bl then
-		return {as, al}
+	if alpha ~= alpha then return {0, 0 / 0} end
+	if alpha == 0 then return {a[1], a[2]} end
+	if alpha == 1 then return {b[1], b[2]} end
+	if a[1] == b[1] and a[2] == b[2] then return {a[1], a[2]} end
+
+	local ds, dl = rawAdd(b[1], b[2], -a[1], a[2])
+	if dl ~= dl then return {0, 0 / 0} end
+	if ds == 0 or alpha == 0 then return {a[1], a[2]} end
+
+	if alpha < 0 then
+		ds = -ds
+		alpha = -alpha
 	end
 
-	local negAs = -as
-	local deltaSign
-	local deltaLog
-	if bl ~= bl or al ~= al then
-		deltaSign = 0
-		deltaLog = 0 / 0
-	elseif bs == 0 then
-		deltaSign = negAs
-		deltaLog = al
-	elseif negAs == 0 then
-		deltaSign = bs
-		deltaLog = bl
-	elseif bs == negAs then
-		deltaSign = bs
-		if bl == al then
-			deltaLog = bl + LOG10_2
-		elseif bl >= al then
-			if bl == math.huge then
-				deltaLog = bl
-			else
-				local delta = al - bl
-				if delta < ADD_CUTOFF then
-					deltaLog = bl
-				else
-					deltaLog = bl + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if al == math.huge then
-				deltaLog = al
-			else
-				local delta = bl - al
-				if delta < ADD_CUTOFF then
-					deltaLog = al
-				else
-					deltaLog = al + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if bl == al then
-			if bl == math.huge then
-				deltaSign = 0
-				deltaLog = 0 / 0
-			else
-				deltaSign = 0
-				deltaLog = 0
-			end
-		elseif bl > al then
-			deltaSign = bs
-			local delta = al - bl
-			if delta < ADD_CUTOFF then
-				deltaLog = bl
-			elseif delta > -1e-300 then
-				deltaLog = bl + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					deltaSign = 0
-					deltaLog = 0
-				else
-					deltaLog = bl + math.log10(difference)
-				end
-			end
-		else
-			deltaSign = negAs
-			local delta = bl - al
-			if delta < ADD_CUTOFF then
-				deltaLog = al
-			elseif delta > -1e-300 then
-				deltaLog = al + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					deltaSign = 0
-					deltaLog = 0
-				else
-					deltaLog = al + math.log10(difference)
-				end
-			end
-		end
-	end
-	if deltaLog ~= deltaLog then
-		return {0, 0 / 0}
-	end
+	if alpha == 0 then return {a[1], a[2]} end
+	dl += math.log10(alpha)
 
-	local scaledSign
-	local scaledLog
-	if alpha == 0 or deltaSign == 0 then
-		if deltaLog == math.huge and alpha == 0 then
-			return {0, 0 / 0}
-		end
-		scaledSign = 0
-		scaledLog = 0
-	else
-		scaledSign = if alpha < 0 then -deltaSign else deltaSign
-		scaledLog = deltaLog + math.log10(if alpha < 0 then -alpha else alpha)
-		if scaledLog ~= scaledLog then
-			return {0, 0 / 0}
-		end
-		if scaledLog == -math.huge then
-			scaledSign = 0
-			scaledLog = 0
-		end
-	end
-	local resultSign
-	local resultLog
-	if al ~= al or scaledLog ~= scaledLog then
-		resultSign = 0
-		resultLog = 0 / 0
-	elseif as == 0 then
-		resultSign = scaledSign
-		resultLog = scaledLog
-	elseif scaledSign == 0 then
-		resultSign = as
-		resultLog = al
-	elseif as == scaledSign then
-		resultSign = as
-		if al == scaledLog then
-			resultLog = al + LOG10_2
-		elseif al >= scaledLog then
-			if al == math.huge then
-				resultLog = al
-			else
-				local delta = scaledLog - al
-				if delta < ADD_CUTOFF then
-					resultLog = al
-				else
-					resultLog = al + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if scaledLog == math.huge then
-				resultLog = scaledLog
-			else
-				local delta = al - scaledLog
-				if delta < ADD_CUTOFF then
-					resultLog = scaledLog
-				else
-					resultLog = scaledLog + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if al == scaledLog then
-			if al == math.huge then
-				resultSign = 0
-				resultLog = 0 / 0
-			else
-				resultSign = 0
-				resultLog = 0
-			end
-		elseif al > scaledLog then
-			resultSign = as
-			local delta = scaledLog - al
-			if delta < ADD_CUTOFF then
-				resultLog = al
-			elseif delta > -1e-300 then
-				resultLog = al + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					resultSign = 0
-					resultLog = 0
-				else
-					resultLog = al + math.log10(difference)
-				end
-			end
-		else
-			resultSign = scaledSign
-			local delta = al - scaledLog
-			if delta < ADD_CUTOFF then
-				resultLog = scaledLog
-			elseif delta > -1e-300 then
-				resultLog = scaledLog + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					resultSign = 0
-					resultLog = 0
-				else
-					resultLog = scaledLog + math.log10(difference)
-				end
-			end
-		end
-	end
-	return {resultSign, resultLog}
+	local rs, rl = rawAdd(a[1], a[2], ds, dl)
+	return {rs, rl}
 end
 
 --[[
-Returns the interpolation alpha of a value between two Bnum endpoints.
-Example: inverseLerp(0, 10, 5) -> 0.5
+Returns the interpolation alpha of val between a and b:
+
+(val - a) / (b - a)
+
+Both differences and the final division operate on raw canonical fields.
+Identical endpoints return NaN.
 ]]
 function Bnum.inverseLerp(a: Value, b: Value, val: Value): Value
-	local as = a[1]
-	local al = a[2]
-	local bs = b[1]
-	local bl = b[2]
-	local vs = val[1]
-	local vl = val[2]
+	local ns, nl = rawAdd(val[1], val[2], -a[1], a[2])
+	local ds, dl = rawAdd(b[1], b[2], -a[1], a[2])
 
-	local negAs = -as
-	local numSign
-	local numLog
-	if vl ~= vl or al ~= al then
-		numSign = 0
-		numLog = 0 / 0
-	elseif vs == 0 then
-		numSign = negAs
-		numLog = al
-	elseif negAs == 0 then
-		numSign = vs
-		numLog = vl
-	elseif vs == negAs then
-		numSign = vs
-		if vl == al then
-			numLog = vl + LOG10_2
-		elseif vl >= al then
-			if vl == math.huge then
-				numLog = vl
-			else
-				local delta = al - vl
-				if delta < ADD_CUTOFF then
-					numLog = vl
-				else
-					numLog = vl + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if al == math.huge then
-				numLog = al
-			else
-				local delta = vl - al
-				if delta < ADD_CUTOFF then
-					numLog = al
-				else
-					numLog = al + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if vl == al then
-			if vl == math.huge then
-				numSign = 0
-				numLog = 0 / 0
-			else
-				numSign = 0
-				numLog = 0
-			end
-		elseif vl > al then
-			numSign = vs
-			local delta = al - vl
-			if delta < ADD_CUTOFF then
-				numLog = vl
-			elseif delta > -1e-300 then
-				numLog = vl + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					numSign = 0
-					numLog = 0
-				else
-					numLog = vl + math.log10(difference)
-				end
-			end
-		else
-			numSign = negAs
-			local delta = vl - al
-			if delta < ADD_CUTOFF then
-				numLog = al
-			elseif delta > -1e-300 then
-				numLog = al + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					numSign = 0
-					numLog = 0
-				else
-					numLog = al + math.log10(difference)
-				end
-			end
-		end
-	end
-	local negAs2 = -as
-	local denSign
-	local denLog
-	if bl ~= bl or al ~= al then
-		denSign = 0
-		denLog = 0 / 0
-	elseif bs == 0 then
-		denSign = negAs2
-		denLog = al
-	elseif negAs2 == 0 then
-		denSign = bs
-		denLog = bl
-	elseif bs == negAs2 then
-		denSign = bs
-		if bl == al then
-			denLog = bl + LOG10_2
-		elseif bl >= al then
-			if bl == math.huge then
-				denLog = bl
-			else
-				local delta = al - bl
-				if delta < ADD_CUTOFF then
-					denLog = bl
-				else
-					denLog = bl + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if al == math.huge then
-				denLog = al
-			else
-				local delta = bl - al
-				if delta < ADD_CUTOFF then
-					denLog = al
-				else
-					denLog = al + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if bl == al then
-			if bl == math.huge then
-				denSign = 0
-				denLog = 0 / 0
-			else
-				denSign = 0
-				denLog = 0
-			end
-		elseif bl > al then
-			denSign = bs
-			local delta = al - bl
-			if delta < ADD_CUTOFF then
-				denLog = bl
-			elseif delta > -1e-300 then
-				denLog = bl + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					denSign = 0
-					denLog = 0
-				else
-					denLog = bl + math.log10(difference)
-				end
-			end
-		else
-			denSign = negAs2
-			local delta = bl - al
-			if delta < ADD_CUTOFF then
-				denLog = al
-			elseif delta > -1e-300 then
-				denLog = al + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					denSign = 0
-					denLog = 0
-				else
-					denLog = al + math.log10(difference)
-				end
-			end
-		end
-	end
+	if nl ~= nl or dl ~= dl or ds == 0 then return {0, 0 / 0} end
 
-	local resultLog = numLog - denLog
-	if resultLog ~= resultLog then
-		return {0, 0 / 0}
-	end
-	if denSign == 0 then
-		if numSign == 0 then
-			return {0, 0 / 0}
-		end
-		return {numSign, math.huge}
-	end
-	if numSign == 0 or resultLog == -math.huge then
-		return {0, 0}
-	end
-	return {numSign * denSign, resultLog}
+	local rs, rl = rawDiv(ns, nl, ds, dl)
+	return {rs, rl}
 end
 
 --[[
-Maps a Bnum from one numeric range into another range.
-Example: 5 from [0,10] to [0,100] -> 50
+Remaps val from [inMin, inMax] into [outMin, outMax].
+
+The implementation computes the interpolation ratio and output delta entirely
+with raw sign/log pairs, replacing the older duplicated add/subtract code.
 ]]
 function Bnum.remap(val: Value, inMin: Value, inMax: Value, outMin: Value, outMax: Value): Value
-	local vs = val[1]
-	local vl = val[2]
-	local inMinS = inMin[1]
-	local inMinL = inMin[2]
-	local inMaxS = inMax[1]
-	local inMaxL = inMax[2]
-	local outMinS = outMin[1]
-	local outMinL = outMin[2]
-	local outMaxS = outMax[1]
-	local outMaxL = outMax[2]
+	local ns, nl = rawAdd(val[1], val[2], -inMin[1], inMin[2])
+	local ds, dl = rawAdd(inMax[1], inMax[2], -inMin[1], inMin[2])
 
-	local negInMinS = -inMinS
-	local alphaNumS
-	local alphaNumL
-	if vl ~= vl or inMinL ~= inMinL then
-		alphaNumS = 0
-		alphaNumL = 0 / 0
-	elseif vs == 0 then
-		alphaNumS = negInMinS
-		alphaNumL = inMinL
-	elseif negInMinS == 0 then
-		alphaNumS = vs
-		alphaNumL = vl
-	elseif vs == negInMinS then
-		alphaNumS = vs
-		if vl == inMinL then
-			alphaNumL = vl + LOG10_2
-		elseif vl >= inMinL then
-			if vl == math.huge then
-				alphaNumL = vl
-			else
-				local delta = inMinL - vl
-				if delta < ADD_CUTOFF then
-					alphaNumL = vl
-				else
-					alphaNumL = vl + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if inMinL == math.huge then
-				alphaNumL = inMinL
-			else
-				local delta = vl - inMinL
-				if delta < ADD_CUTOFF then
-					alphaNumL = inMinL
-				else
-					alphaNumL = inMinL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if vl == inMinL then
-			if vl == math.huge then
-				alphaNumS = 0
-				alphaNumL = 0 / 0
-			else
-				alphaNumS = 0
-				alphaNumL = 0
-			end
-		elseif vl > inMinL then
-			alphaNumS = vs
-			local delta = inMinL - vl
-			if delta < ADD_CUTOFF then
-				alphaNumL = vl
-			elseif delta > -1e-300 then
-				alphaNumL = vl + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					alphaNumS = 0
-					alphaNumL = 0
-				else
-					alphaNumL = vl + math.log10(difference)
-				end
-			end
-		else
-			alphaNumS = negInMinS
-			local delta = vl - inMinL
-			if delta < ADD_CUTOFF then
-				alphaNumL = inMinL
-			elseif delta > -1e-300 then
-				alphaNumL = inMinL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					alphaNumS = 0
-					alphaNumL = 0
-				else
-					alphaNumL = inMinL + math.log10(difference)
-				end
-			end
-		end
-	end
-	local negInMinS2 = -inMinS
-	local alphaDenS
-	local alphaDenL
-	if inMaxL ~= inMaxL or inMinL ~= inMinL then
-		alphaDenS = 0
-		alphaDenL = 0 / 0
-	elseif inMaxS == 0 then
-		alphaDenS = negInMinS2
-		alphaDenL = inMinL
-	elseif negInMinS2 == 0 then
-		alphaDenS = inMaxS
-		alphaDenL = inMaxL
-	elseif inMaxS == negInMinS2 then
-		alphaDenS = inMaxS
-		if inMaxL == inMinL then
-			alphaDenL = inMaxL + LOG10_2
-		elseif inMaxL >= inMinL then
-			if inMaxL == math.huge then
-				alphaDenL = inMaxL
-			else
-				local delta = inMinL - inMaxL
-				if delta < ADD_CUTOFF then
-					alphaDenL = inMaxL
-				else
-					alphaDenL = inMaxL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if inMinL == math.huge then
-				alphaDenL = inMinL
-			else
-				local delta = inMaxL - inMinL
-				if delta < ADD_CUTOFF then
-					alphaDenL = inMinL
-				else
-					alphaDenL = inMinL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if inMaxL == inMinL then
-			if inMaxL == math.huge then
-				alphaDenS = 0
-				alphaDenL = 0 / 0
-			else
-				alphaDenS = 0
-				alphaDenL = 0
-			end
-		elseif inMaxL > inMinL then
-			alphaDenS = inMaxS
-			local delta = inMinL - inMaxL
-			if delta < ADD_CUTOFF then
-				alphaDenL = inMaxL
-			elseif delta > -1e-300 then
-				alphaDenL = inMaxL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					alphaDenS = 0
-					alphaDenL = 0
-				else
-					alphaDenL = inMaxL + math.log10(difference)
-				end
-			end
-		else
-			alphaDenS = negInMinS2
-			local delta = inMaxL - inMinL
-			if delta < ADD_CUTOFF then
-				alphaDenL = inMinL
-			elseif delta > -1e-300 then
-				alphaDenL = inMinL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					alphaDenS = 0
-					alphaDenL = 0
-				else
-					alphaDenL = inMinL + math.log10(difference)
-				end
-			end
-		end
-	end
+	if nl ~= nl or dl ~= dl or ds == 0 then return {0, 0 / 0} end
 
-	local alphaL = alphaNumL - alphaDenL
-	local alphaS
-	if alphaL ~= alphaL then
-		return {0, 0 / 0}
-	end
-	if alphaDenS == 0 then
-		if alphaNumS == 0 then
-			return {0, 0 / 0}
-		end
-		alphaS = alphaNumS
-		alphaL = math.huge
-	elseif alphaNumS == 0 or alphaL == -math.huge then
-		alphaS = 0
-		alphaL = 0
-	else
-		alphaS = alphaNumS * alphaDenS
-	end
+	local alphaS, alphaL = rawDiv(ns, nl, ds, dl)
+	if alphaL ~= alphaL then return {0, 0 / 0} end
 
-	local negOutMinS = -outMinS
-	local outDeltaS
-	local outDeltaL
-	if outMaxL ~= outMaxL or outMinL ~= outMinL then
-		outDeltaS = 0
-		outDeltaL = 0 / 0
-	elseif outMaxS == 0 then
-		outDeltaS = negOutMinS
-		outDeltaL = outMinL
-	elseif negOutMinS == 0 then
-		outDeltaS = outMaxS
-		outDeltaL = outMaxL
-	elseif outMaxS == negOutMinS then
-		outDeltaS = outMaxS
-		if outMaxL == outMinL then
-			outDeltaL = outMaxL + LOG10_2
-		elseif outMaxL >= outMinL then
-			if outMaxL == math.huge then
-				outDeltaL = outMaxL
-			else
-				local delta = outMinL - outMaxL
-				if delta < ADD_CUTOFF then
-					outDeltaL = outMaxL
-				else
-					outDeltaL = outMaxL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if outMinL == math.huge then
-				outDeltaL = outMinL
-			else
-				local delta = outMaxL - outMinL
-				if delta < ADD_CUTOFF then
-					outDeltaL = outMinL
-				else
-					outDeltaL = outMinL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if outMaxL == outMinL then
-			if outMaxL == math.huge then
-				outDeltaS = 0
-				outDeltaL = 0 / 0
-			else
-				outDeltaS = 0
-				outDeltaL = 0
-			end
-		elseif outMaxL > outMinL then
-			outDeltaS = outMaxS
-			local delta = outMinL - outMaxL
-			if delta < ADD_CUTOFF then
-				outDeltaL = outMaxL
-			elseif delta > -1e-300 then
-				outDeltaL = outMaxL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					outDeltaS = 0
-					outDeltaL = 0
-				else
-					outDeltaL = outMaxL + math.log10(difference)
-				end
-			end
-		else
-			outDeltaS = negOutMinS
-			local delta = outMaxL - outMinL
-			if delta < ADD_CUTOFF then
-				outDeltaL = outMinL
-			elseif delta > -1e-300 then
-				outDeltaL = outMinL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					outDeltaS = 0
-					outDeltaL = 0
-				else
-					outDeltaL = outMinL + math.log10(difference)
-				end
-			end
-		end
-	end
+	local outDeltaS, outDeltaL = rawAdd(outMax[1], outMax[2], -outMin[1], outMin[2])
+	if outDeltaL ~= outDeltaL then return {0, 0 / 0} end
 
-	local scaledS
-	local scaledL = outDeltaL + alphaL
-	if scaledL ~= scaledL then
-		return {0, 0 / 0}
-	end
-	if outDeltaS == 0 or alphaS == 0 then
-		if scaledL == math.huge then
-			return {0, 0 / 0}
-		end
-		scaledS = 0
-		scaledL = 0
-	else
-		scaledS = outDeltaS * alphaS
-		if scaledL == -math.huge then
-			scaledS = 0
-			scaledL = 0
-		end
-	end
-	local resultS
-	local resultL
-	if outMinL ~= outMinL or scaledL ~= scaledL then
-		resultS = 0
-		resultL = 0 / 0
-	elseif outMinS == 0 then
-		resultS = scaledS
-		resultL = scaledL
-	elseif scaledS == 0 then
-		resultS = outMinS
-		resultL = outMinL
-	elseif outMinS == scaledS then
-		resultS = outMinS
-		if outMinL == scaledL then
-			resultL = outMinL + LOG10_2
-		elseif outMinL >= scaledL then
-			if outMinL == math.huge then
-				resultL = outMinL
-			else
-				local delta = scaledL - outMinL
-				if delta < ADD_CUTOFF then
-					resultL = outMinL
-				else
-					resultL = outMinL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if scaledL == math.huge then
-				resultL = scaledL
-			else
-				local delta = outMinL - scaledL
-				if delta < ADD_CUTOFF then
-					resultL = scaledL
-				else
-					resultL = scaledL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if outMinL == scaledL then
-			if outMinL == math.huge then
-				resultS = 0
-				resultL = 0 / 0
-			else
-				resultS = 0
-				resultL = 0
-			end
-		elseif outMinL > scaledL then
-			resultS = outMinS
-			local delta = scaledL - outMinL
-			if delta < ADD_CUTOFF then
-				resultL = outMinL
-			elseif delta > -1e-300 then
-				resultL = outMinL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					resultS = 0
-					resultL = 0
-				else
-					resultL = outMinL + math.log10(difference)
-				end
-			end
-		else
-			resultS = scaledS
-			local delta = outMinL - scaledL
-			if delta < ADD_CUTOFF then
-				resultL = scaledL
-			elseif delta > -1e-300 then
-				resultL = scaledL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					resultS = 0
-					resultL = 0
-				else
-					resultL = scaledL + math.log10(difference)
-				end
-			end
-		end
-	end
-	return {resultS, resultL}
+	local scaledS, scaledL = rawMul(outDeltaS, outDeltaL, alphaS, alphaL)
+	local rs, rl = rawAdd(outMin[1], outMin[2], scaledS, scaledL)
+	return {rs, rl}
 end
 
 --[[
-Adds every Bnum in an array using an inline accumulator.
-Example: {1, 2, 3} -> 6
+Adds every Bnum in an array.
+
+The accumulator stays as two local numbers and uses rawAdd(), so the loop does
+not allocate one result table per element. Only the final Bnum is allocated.
 ]]
 function Bnum.sum(values: {Value}): Value
 	local count = #values
-	if count == 0 then
-		return {0, 0}
+	if count == 0 then return {0, 0} end
+
+	local accS = 0
+	local accL = 0
+
+	for i = 1, count do
+		local value = values[i]
+		accS, accL = rawAdd(accS, accL, value[1], value[2])
 	end
 
-	local accSign = 0
-	local accLog = 0
-	for i = 1, count do
-		local current = values[i]
-		local valueSign = current[1]
-		local valueLog = current[2]
-		local nextSign
-		local nextLog
-		if accLog ~= accLog or valueLog ~= valueLog then
-			nextSign = 0
-			nextLog = 0 / 0
-		elseif accSign == 0 then
-			nextSign = valueSign
-			nextLog = valueLog
-		elseif valueSign == 0 then
-			nextSign = accSign
-			nextLog = accLog
-		elseif accSign == valueSign then
-			nextSign = accSign
-			if accLog == valueLog then
-				nextLog = accLog + LOG10_2
-			elseif accLog >= valueLog then
-				if accLog == math.huge then
-					nextLog = accLog
-				else
-					local delta = valueLog - accLog
-					if delta < ADD_CUTOFF then
-						nextLog = accLog
-					else
-						nextLog = accLog + math.log10(1 + math.exp(delta * LN10))
-					end
-				end
-			else
-				if valueLog == math.huge then
-					nextLog = valueLog
-				else
-					local delta = accLog - valueLog
-					if delta < ADD_CUTOFF then
-						nextLog = valueLog
-					else
-						nextLog = valueLog + math.log10(1 + math.exp(delta * LN10))
-					end
-				end
-			end
-		else
-			if accLog == valueLog then
-				if accLog == math.huge then
-					nextSign = 0
-					nextLog = 0 / 0
-				else
-					nextSign = 0
-					nextLog = 0
-				end
-			elseif accLog > valueLog then
-				nextSign = accSign
-				local delta = valueLog - accLog
-				if delta < ADD_CUTOFF then
-					nextLog = accLog
-				elseif delta > -1e-300 then
-					nextLog = accLog + math.log10(-delta) + LOG10_LN10
-				else
-					local difference
-					if delta > CLOSE_CANCEL then
-						local x = -delta * LN10
-						difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-					else
-						difference = 1 - math.exp(delta * LN10)
-					end
-					if difference <= 0 then
-						nextSign = 0
-						nextLog = 0
-					else
-						nextLog = accLog + math.log10(difference)
-					end
-				end
-			else
-				nextSign = valueSign
-				local delta = accLog - valueLog
-				if delta < ADD_CUTOFF then
-					nextLog = valueLog
-				elseif delta > -1e-300 then
-					nextLog = valueLog + math.log10(-delta) + LOG10_LN10
-				else
-					local difference
-					if delta > CLOSE_CANCEL then
-						local x = -delta * LN10
-						difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-					else
-						difference = 1 - math.exp(delta * LN10)
-					end
-					if difference <= 0 then
-						nextSign = 0
-						nextLog = 0
-					else
-						nextLog = valueLog + math.log10(difference)
-					end
-				end
-			end
-		end
-		accSign = nextSign
-		accLog = nextLog
-	end
-	return {accSign, accLog}
+	return {accS, accL}
 end
 
 --[[
@@ -3874,129 +2692,26 @@ function Bnum.product(values: {Value}): Value
 end
 
 --[[
-Returns the arithmetic mean of all Bnums in an array.
-Example: {2, 4, 6} -> 4
+Returns the arithmetic mean of an array.
+
+The summation uses the raw accumulator kernel and divides by count directly in
+log space, avoiding temporary Bnum tables inside the loop.
 ]]
 function Bnum.mean(values: {Value}): Value
 	local count = #values
-	if count == 0 then
-		return {0, 0 / 0}
-	end
+	if count == 0 then return {0, 0 / 0} end
 
-	local accSign = 0
-	local accLog = 0
+	local accS = 0
+	local accL = 0
+
 	for i = 1, count do
-		local current = values[i]
-		local valueSign = current[1]
-		local valueLog = current[2]
-		local nextSign
-		local nextLog
-		if accLog ~= accLog or valueLog ~= valueLog then
-			nextSign = 0
-			nextLog = 0 / 0
-		elseif accSign == 0 then
-			nextSign = valueSign
-			nextLog = valueLog
-		elseif valueSign == 0 then
-			nextSign = accSign
-			nextLog = accLog
-		elseif accSign == valueSign then
-			nextSign = accSign
-			if accLog == valueLog then
-				nextLog = accLog + LOG10_2
-			elseif accLog >= valueLog then
-				if accLog == math.huge then
-					nextLog = accLog
-				else
-					local delta = valueLog - accLog
-					if delta < ADD_CUTOFF then
-						nextLog = accLog
-					else
-						nextLog = accLog + math.log10(1 + math.exp(delta * LN10))
-					end
-				end
-			else
-				if valueLog == math.huge then
-					nextLog = valueLog
-				else
-					local delta = accLog - valueLog
-					if delta < ADD_CUTOFF then
-						nextLog = valueLog
-					else
-						nextLog = valueLog + math.log10(1 + math.exp(delta * LN10))
-					end
-				end
-			end
-		else
-			if accLog == valueLog then
-				if accLog == math.huge then
-					nextSign = 0
-					nextLog = 0 / 0
-				else
-					nextSign = 0
-					nextLog = 0
-				end
-			elseif accLog > valueLog then
-				nextSign = accSign
-				local delta = valueLog - accLog
-				if delta < ADD_CUTOFF then
-					nextLog = accLog
-				elseif delta > -1e-300 then
-					nextLog = accLog + math.log10(-delta) + LOG10_LN10
-				else
-					local difference
-					if delta > CLOSE_CANCEL then
-						local x = -delta * LN10
-						difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-					else
-						difference = 1 - math.exp(delta * LN10)
-					end
-					if difference <= 0 then
-						nextSign = 0
-						nextLog = 0
-					else
-						nextLog = accLog + math.log10(difference)
-					end
-				end
-			else
-				nextSign = valueSign
-				local delta = accLog - valueLog
-				if delta < ADD_CUTOFF then
-					nextLog = valueLog
-				elseif delta > -1e-300 then
-					nextLog = valueLog + math.log10(-delta) + LOG10_LN10
-				else
-					local difference
-					if delta > CLOSE_CANCEL then
-						local x = -delta * LN10
-						difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-					else
-						difference = 1 - math.exp(delta * LN10)
-					end
-					if difference <= 0 then
-						nextSign = 0
-						nextLog = 0
-					else
-						nextLog = valueLog + math.log10(difference)
-					end
-				end
-			end
-		end
-		accSign = nextSign
-		accLog = nextLog
+		local value = values[i]
+		accS, accL = rawAdd(accS, accL, value[1], value[2])
 	end
 
-	if accLog ~= accLog then
-		return {0, 0 / 0}
-	end
-	if accSign == 0 then
-		return {0, 0}
-	end
-	local resultLog = accLog - math.log10(count)
-	if resultLog == -math.huge then
-		return {0, 0}
-	end
-	return {accSign, resultLog}
+	if accL ~= accL then return {0, 0 / 0} end
+	if accS == 0 then return {0, 0} end
+	return {accS, accL - math.log10(count)}
 end
 
 --[[
@@ -4026,137 +2741,34 @@ function Bnum.percent(part: Value, whole: Value): Value
 end
 
 --[[
-Returns the percentage change from an old Bnum to a new Bnum.
-Example: 100 -> 125 gives 25
+Returns ((newValue - oldValue) / abs(oldValue)) * 100.
+
+The function now reuses raw subtraction/division instead of embedding a full
+copy of cancellation math.
+
+A zero old value returns signed infinity when the new value is nonzero.
 ]]
 function Bnum.percentChange(oldValue: Value, newValue: Value): Value
 	local oldS = oldValue[1]
 	local oldL = oldValue[2]
 	local newS = newValue[1]
 	local newL = newValue[2]
-	if oldL ~= oldL or newL ~= newL then
-		return {0, 0 / 0}
-	end
-	if oldS == newS and oldL == newL then
-		return {0, 0}
-	end
+
+	if oldL ~= oldL or newL ~= newL then return {0, 0 / 0} end
+	if oldS == newS and oldL == newL then return {0, 0} end
+
 	if oldS == 0 then
-		local newSign = math.sign(newS)
-		if newSign == 0 then
-			return {0, 0 / 0}
-		end
-		return {newSign, math.huge}
+		if newS == 0 then return {0, 0 / 0} end
+		return {math.sign(newS), math.huge}
 	end
 
-	local negOldS = -oldS
-	local deltaS
-	local deltaL
-	if newL ~= newL or oldL ~= oldL then
-		deltaS = 0
-		deltaL = 0 / 0
-	elseif newS == 0 then
-		deltaS = negOldS
-		deltaL = oldL
-	elseif negOldS == 0 then
-		deltaS = newS
-		deltaL = newL
-	elseif newS == negOldS then
-		deltaS = newS
-		if newL == oldL then
-			deltaL = newL + LOG10_2
-		elseif newL >= oldL then
-			if newL == math.huge then
-				deltaL = newL
-			else
-				local delta = oldL - newL
-				if delta < ADD_CUTOFF then
-					deltaL = newL
-				else
-					deltaL = newL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		else
-			if oldL == math.huge then
-				deltaL = oldL
-			else
-				local delta = newL - oldL
-				if delta < ADD_CUTOFF then
-					deltaL = oldL
-				else
-					deltaL = oldL + math.log10(1 + math.exp(delta * LN10))
-				end
-			end
-		end
-	else
-		if newL == oldL then
-			if newL == math.huge then
-				deltaS = 0
-				deltaL = 0 / 0
-			else
-				deltaS = 0
-				deltaL = 0
-			end
-		elseif newL > oldL then
-			deltaS = newS
-			local delta = oldL - newL
-			if delta < ADD_CUTOFF then
-				deltaL = newL
-			elseif delta > -1e-300 then
-				deltaL = newL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					deltaS = 0
-					deltaL = 0
-				else
-					deltaL = newL + math.log10(difference)
-				end
-			end
-		else
-			deltaS = negOldS
-			local delta = newL - oldL
-			if delta < ADD_CUTOFF then
-				deltaL = oldL
-			elseif delta > -1e-300 then
-				deltaL = oldL + math.log10(-delta) + LOG10_LN10
-			else
-				local difference
-				if delta > CLOSE_CANCEL then
-					local x = -delta * LN10
-					difference = x * (1 + x * (-0.5 + x * (0.16666666666666666 + x * (-0.041666666666666664 + x * 0.008333333333333333))))
-				else
-					difference = 1 - math.exp(delta * LN10)
-				end
-				if difference <= 0 then
-					deltaS = 0
-					deltaL = 0
-				else
-					deltaL = oldL + math.log10(difference)
-				end
-			end
-		end
-	end
-	if deltaL ~= deltaL then
-		return {0, 0 / 0}
-	end
-	if deltaS == 0 then
-		return {0, 0}
-	end
+	local ds, dl = rawAdd(newS, newL, -oldS, oldL)
+	if dl ~= dl then return {0, 0 / 0} end
+	if ds == 0 then return {0, 0} end
 
-	local resultLog = deltaL - oldL + 2
-	if resultLog ~= resultLog then
-		return {0, 0 / 0}
-	end
-	if resultLog == -math.huge then
-		return {0, 0}
-	end
-	return {deltaS * oldS, resultLog}
+	local rs, rl = rawDiv(ds, dl, 1, oldL)
+	if rl ~= rl then return {0, 0 / 0} end
+	return {rs, rl + 2}
 end
 
 --[[
@@ -4225,24 +2837,20 @@ Bnum.ROMAN_CLASSICAL_MAX = 3999
 Bnum.ROMAN_EXTENDED_MAX = 9007199254740991
 
 Bnum.FormatTypes = table.freeze({
-	Auto = "Auto",
-	Suffix = "Suffix",
-	SuffixLong = "SuffixLong",
-	Scientific = "Scientific",
-	Engineering = "Engineering",
-	Standard = "Standard",
-	Comma = "Comma",
-	Logarithm = "Logarithm",
-	Raw = "Raw",
-	StandardSuffix = "standard",
-	Extended = "extended",
-	Hybrid = "hybrid",
-	Alphabetic = "alphabetic",
-	Metric = "metric",
-	Exponent = "exponent",
-	Roman = "roman",
-	RomanExtended = "romanextended",
-	Plain = "plain",
+	standard = "standard",
+	extended = "extended",
+	hybrid = "hybrid",
+	alphabetic = "alphabetic",
+	metric = "metric",
+	exponent = "exponent",
+	scientific = "scientific",
+	engineering = "engineering",
+	roman = "roman",
+	romanextended = "romanextended",
+	plain = "plain",
+	comma = "comma",
+	logarithm = "logarithm",
+	raw = "raw",
 })
 
 Bnum.SuffixTypes = table.freeze({
@@ -4311,25 +2919,21 @@ local FORMAT_DIRECT_LOG_MIN = -323.3062153431158
 local ROMAN_VALUES = {1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1}
 local ROMAN_SYMBOLS = {"M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"}
 
-local FORMAT_KIND_ALIASES = table.freeze({
-	auto = "standard",
-	suffix = "standard",
-	suffixlong = "long",
-	scientific = "scientific",
-	engineering = "engineering",
-	standard = "standard",
-	comma = "comma",
-	logarithm = "logarithm",
-	raw = "raw",
-	plain = "plain",
-	extended = "extended",
-	hybrid = "hybrid",
-	alphabetic = "alphabetic",
-	metric = "metric",
-	exponent = "exponent",
-	roman = "roman",
-	romanextended = "romanextended",
-	long = "long",
+local FORMAT_KINDS = table.freeze({
+	standard = true,
+	extended = true,
+	hybrid = true,
+	alphabetic = true,
+	metric = true,
+	exponent = true,
+	scientific = true,
+	engineering = true,
+	roman = true,
+	romanextended = true,
+	plain = true,
+	comma = true,
+	logarithm = true,
+	raw = true,
 })
 
 local function resolveFormatPrecision(value: number?): number
@@ -4357,8 +2961,8 @@ end
 
 local function resolveFormatKind(formatType: string?): string
 	if formatType == nil then return Bnum.DEFAULT_FORMAT end
-	local lowered = string.lower(formatType)
-	return FORMAT_KIND_ALIASES[lowered] or Bnum.DEFAULT_FORMAT
+	if FORMAT_KINDS[formatType] then return formatType end
+	return Bnum.DEFAULT_FORMAT
 end
 
 local function alphabeticFormatSuffix(index: number): string?
@@ -4598,26 +3202,6 @@ local function bnumFormatCore(val: Value, precision: number, kind: string): stri
 	return negative and "-" .. text or text
 end
 
-local function longFormatCore(val: Value, precision: number): string
-	local sign = val[1]
-	local logMagnitude = val[2]
-	if logMagnitude ~= logMagnitude then return "NaN" end
-	if sign == 0 then return "0" end
-	if logMagnitude == math.huge then return sign < 0 and "-inf" or "inf" end
-	if logMagnitude < 3 or logMagnitude >= Bnum.E_NOTATION_START then
-		return bnumFormatCore(val, precision, "standard")
-	end
-	local tier = math.floor(logMagnitude / 3)
-	if tier < 1 or tier >= #longSuffixes then return bnumFormatCore(val, precision, "standard") end
-	local scaled = math.round(sign * (10 ^ (logMagnitude - tier * 3)) * FORMAT_FACTORS[precision + 1]) / FORMAT_FACTORS[precision + 1]
-	if scaled >= 1000 or scaled <= -1000 then
-		scaled *= 0.001
-		tier += 1
-		if tier >= #longSuffixes then return bnumFormatCore(val, precision, "standard") end
-	end
-	return shortFormatNumber(scaled, precision) .. " " .. longSuffixes[tier + 1]
-end
-
 --[[
 Returns the suffix used by the standard formatter through tier 999.
 Examples: tier 1 -> "k", tier 101 -> "Ce", tier 102 -> "UCe"
@@ -4633,16 +3217,15 @@ end
 Checks whether a formatter notation name is supported.
 ]]
 function Bnum.isFormatType(formatType: string): boolean
-	return FORMAT_KIND_ALIASES[string.lower(formatType)] ~= nil
+	return FORMAT_KINDS[formatType] == true
 end
 
 --[[
 Sets the default notation used by Bnum.format().
 ]]
 function Bnum.setDefaultFormat(formatType: string): boolean
-	local kind = resolveFormatKind(formatType)
-	if FORMAT_KIND_ALIASES[string.lower(formatType)] == nil then return false end
-	Bnum.DEFAULT_FORMAT = kind
+	if FORMAT_KINDS[formatType] ~= true then return false end
+	Bnum.DEFAULT_FORMAT = formatType
 	return true
 end
 
@@ -4652,9 +3235,7 @@ Examples: 1250000 -> "1.25M", 10^3000 -> "E3k"
 ]]
 function Bnum.format(val: Value, decimalPlaces: number?, formatType: FormatType?): string
 	local precision = resolveFormatPrecision(decimalPlaces)
-	local kind = resolveFormatKind(formatType)
-	if kind == "long" then return longFormatCore(val, precision) end
-	return bnumFormatCore(val, precision, kind)
+	return bnumFormatCore(val, precision, resolveFormatKind(formatType))
 end
 
 --[[
@@ -4730,21 +3311,6 @@ function Bnum.formatRomanExtended(val: Value, decimalPlaces: number?): string
 end
 
 --[[
-Legacy alias for the standard suffix formatter.
-]]
-function Bnum.formatSuffix(val: Value, decimalPlaces: number?): string
-	return bnumFormatCore(val, resolveFormatPrecision(decimalPlaces), "standard")
-end
-
---[[
-Legacy long-name suffix formatter.
-Example: 2000000 -> "2 Million"
-]]
-function Bnum.formatSuffixLong(val: Value, decimalPlaces: number?): string
-	return longFormatCore(val, resolveFormatPrecision(decimalPlaces))
-end
-
---[[
 Formats as a fixed decimal when representable.
 Large values fall back to the standard display ladder.
 ]]
@@ -4772,21 +3338,6 @@ Returns the raw {sign, logMagnitude} representation.
 ]]
 function Bnum.formatRaw(val: Value): string
 	return "{" .. tostring(val[1]) .. ", " .. tostring(val[2]) .. "}"
-end
-
---[[
-Compatibility entry point. The NanoNum-style standard formatter is now the default.
-Existing option fields are retained where they map cleanly to the new formatter.
-]]
-function Bnum.autoFormat(val: Value, digits: number?, options: AutoFormatOptions?): string
-	local precision = digits
-	local kind = Bnum.DEFAULT_FORMAT
-	if options ~= nil then
-		if precision == nil then precision = options.Digits end
-		if options.LongSuffix == true then kind = "long" end
-	end
-	if kind == "long" then return longFormatCore(val, resolveFormatPrecision(precision)) end
-	return bnumFormatCore(val, resolveFormatPrecision(precision), kind)
 end
 
 --[[
@@ -5959,6 +4510,161 @@ function Bnum.addMulInto(out: Value, a: Value, b: Value, c: Value): Value
 end
 
 --==============================================================
+-- Leaderboard encoding
+--==============================================================
+
+--[[
+Encodes a canonical Bnum into one sortable safe integer for leaderboard storage.
+
+v2 encodes the stored logMagnitude directly instead of applying nested
+value-space logarithms. The transformed coordinate is:
+
+u = sign(logMagnitude) * log10(1 + abs(logMagnitude))
+
+The coordinate is quantized into a finite integer band below 2^52, preserving
+normal numeric ordering:
+
+negative values < zero < positive values
+
+and preserving magnitude ordering inside both signs.
+
+Unlike the v1.4.1 codec, finite values below 1 remain distinct instead of
+collapsing to zero at very negative log magnitudes.
+
+Special values use reserved safe-integer codes:
++/-infinity -> +/-Bnum.LB_INFINITY_CODE
+NaN         -> Bnum.LB_NAN_CODE
+
+Example:
+local encoded = Bnum.lbencode(Bnum.fromString("1e1000"))
+]]
+function Bnum.lbencode(val: Value): number
+	local sign = val[1]
+	local logMagnitude = val[2]
+
+	if logMagnitude ~= logMagnitude then
+		return LB_NAN_CODE
+	end
+
+	if sign == 0 or logMagnitude == -math.huge then
+		return 0
+	end
+
+	sign = math.sign(sign)
+
+	if logMagnitude == math.huge then
+		return sign * LB_INFINITY_CODE
+	end
+
+	local absLog = math.abs(logMagnitude)
+	local transformed
+
+	-- Stable log10(1 + absLog) close to zero.
+	if absLog < 1e-4 then
+		local x = absLog
+		local x2 = x * x
+		local ln1p = x - x2 * 0.5 + x2 * x * 0.3333333333333333 - x2 * x2 * 0.25 + x2 * x2 * x * 0.2
+		transformed = ln1p / LN10
+	else
+		transformed = math.log10(absLog + 1)
+	end
+
+	if logMagnitude < 0 then
+		transformed = -transformed
+	end
+
+	-- Quantize the signed transform separately from the center. This makes
+	-- logMagnitude == 0 map exactly to LB_CENTER_CODE and avoids cancellation.
+	local offset = math.round(transformed * LB_SCALE)
+	local magnitude = LB_CENTER_CODE + offset
+
+	if magnitude < LB_MIN_FINITE_CODE then
+		magnitude = LB_MIN_FINITE_CODE
+	elseif magnitude > LB_MAX_FINITE_CODE then
+		magnitude = LB_MAX_FINITE_CODE
+	end
+
+	return sign * magnitude
+end
+
+--[[
+Decodes a leaderboard number into canonical Bnum form.
+
+v1.5 codes are exact safe integers below 2^52. Legacy codec decoding has been
+removed; only the current codec is accepted.
+
+The v2 inverse reconstructs logMagnitude directly, so it never materializes the
+actual gigantic value as a native Luau number.
+
+Example:
+local value = Bnum.lbdecode(encoded)
+]]
+function Bnum.lbdecode(encoded: number): Value
+	if encoded ~= encoded then
+		return {0, 0 / 0}
+	end
+
+	if encoded == 0 then
+		return {0, 0}
+	end
+
+	if encoded == math.huge then
+		return {1, math.huge}
+	end
+
+	if encoded == -math.huge then
+		return {-1, math.huge}
+	end
+
+	local sign = math.sign(encoded)
+	local magnitude = math.abs(encoded)
+
+	-- New v2 codes are exact integers.
+	if magnitude % 1 ~= 0 then
+		return {0, 0 / 0}
+	end
+
+	if magnitude == LB_NAN_CODE then
+		return {0, 0 / 0}
+	end
+
+	if magnitude == LB_INFINITY_CODE then
+		return {sign, math.huge}
+	end
+
+	-- v2 finite range.
+	if magnitude >= LB_MIN_FINITE_CODE and magnitude <= LB_MAX_FINITE_CODE then
+		local transformed = (magnitude - LB_CENTER_CODE) / LB_SCALE
+		local absTransformed = math.abs(transformed)
+		local absLog
+
+		-- The top quantization bin represents the largest finite f64 log value.
+		if absTransformed >= MAX_LOG10_DOUBLE then
+			absLog = MAX_FINITE_DOUBLE
+		else
+			local z = absTransformed * LN10
+
+			-- Stable expm1(z) near zero.
+			if z < 1e-4 then
+				local z2 = z * z
+				absLog = z + z2 * 0.5 + z2 * z * 0.16666666666666666 + z2 * z2 * 0.041666666666666664 + z2 * z2 * z * 0.008333333333333333
+			else
+				absLog = math.exp(z) - 1
+			end
+		end
+
+		if absLog ~= absLog then
+			return {0, 0 / 0}
+		end
+
+		local logMagnitude = if transformed < 0 then -absLog else absLog
+		return {sign, logMagnitude}
+	end
+
+	return {0, 0 / 0}
+end
+
+--==============================================================
 -- Convenience API
 --==============================================================
 
@@ -6127,6 +4833,14 @@ Example: Bnum.ToString(9500) -> "9.5e3"
 ]]
 function Bnum.ToString(value: any): string
 	return Bnum.toString(convertAny(value))
+end
+
+--[[
+Serializes any supported input using the stored Bnum logarithmic exponent.
+Example: 9500 -> "1e3.9777236052888477"
+]]
+function Bnum.ToBnumString(value: any): string
+	return Bnum.toBnumString(convertAny(value))
 end
 
 --[[
@@ -6777,20 +5491,6 @@ function Bnum.FormatRomanExtended(value: any, decimalPlaces: number?): string
 end
 
 --[[
-Formats any supported input using the short suffix notation.
-]]
-function Bnum.FormatSuffix(value: any, decimalPlaces: number?): string
-	return Bnum.formatSuffix(convertAny(value), decimalPlaces)
-end
-
---[[
-Formats any supported input using long suffix names.
-]]
-function Bnum.FormatSuffixLong(value: any, decimalPlaces: number?): string
-	return Bnum.formatSuffixLong(convertAny(value), decimalPlaces)
-end
-
---[[
 Formats any supported input as a plain decimal string when practical.
 ]]
 function Bnum.FormatPlain(value: any, decimalPlaces: number?): string
@@ -6816,13 +5516,6 @@ Formats any supported input as its raw Bnum representation.
 ]]
 function Bnum.FormatRaw(value: any): string
 	return Bnum.formatRaw(convertAny(value))
-end
-
---[[
-Automatically selects a suitable notation for any supported input.
-]]
-function Bnum.AutoFormat(value: any, digits: number?, options: AutoFormatOptions?): string
-	return Bnum.autoFormat(convertAny(value), digits, options)
 end
 
 --[[
@@ -6922,6 +5615,67 @@ Computes a + b × c from converted inputs directly into out.
 ]]
 function Bnum.AddMulInto(out: Value, a: any, b: any, c: any): Value
 	return Bnum.addMulInto(out, convertAny(a), convertAny(b), convertAny(c))
+end
+
+--[[
+Raises a supported value to an integer power using the specialized integer path.
+Example: PowInteger("-2", 3) -> -8
+]]
+function Bnum.PowInteger(value: any, power: number): Value
+	return Bnum.powInteger(convertAny(value), power)
+end
+
+--[[
+Returns the arithmetic midpoint of two supported values.
+Example: Midpoint(10, "20") -> 15
+]]
+function Bnum.Midpoint(a: any, b: any): Value
+	return Bnum.midpoint(convertAny(a), convertAny(b))
+end
+
+--[[
+Returns the real geometric mean of two supported non-negative values.
+Example: GeometricMean(4, 16) -> 8
+]]
+function Bnum.GeometricMean(a: any, b: any): Value
+	return Bnum.geometricMean(convertAny(a), convertAny(b))
+end
+
+--[[
+Returns the quadratic mean / RMS of two supported values.
+Example: QuadraticMean(3, 4) -> sqrt(12.5)
+]]
+function Bnum.QuadraticMean(a: any, b: any): Value
+	return Bnum.quadraticMean(convertAny(a), convertAny(b))
+end
+
+--[[
+Clamps a supported value to [0, 1].
+Example: Saturate("1.5") -> 1
+]]
+function Bnum.Saturate(value: any): Value
+	return Bnum.saturate(convertAny(value))
+end
+
+--[[
+Encodes a number, string, or Bnum-like value with the v2 leaderboard codec.
+Automatically converts the input before using the core lbencode codec.
+
+Example:
+local encoded = Bnum.Lbencode("1e1000")
+]]
+function Bnum.Lbencode(value: any): number
+	return Bnum.lbencode(convertAny(value))
+end
+
+--[[
+Decodes a current v1.5 leaderboard code into a Bnum.
+
+Example:
+local value = Bnum.Lbdecode(encoded)
+]]
+function Bnum.Lbdecode(encoded: number): Value
+	return Bnum.lbdecode(encoded)
 end
 
 return Bnum
