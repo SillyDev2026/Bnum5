@@ -1,47 +1,53 @@
-# Bnum v1.4.0
+# Bnum v1.6.0
 
 **Bnum** is a high-performance big-number library for Roblox Luau built around a compact two-number logarithmic representation.
 
 ```text
-Version:          1.4.0
+Version:          1.6.0
 Representation:   {sign, logMagnitude}
 Value:            sign × 10^logMagnitude
-Core API:         122 lowercase functions
-Convenience API:  123 PascalCase functions
-Total Public API: 245 functions
+Core API:         127 lowercase functions
+Convenience API:  128 PascalCase functions
+Total Public API: 255 functions
 Compiler:         --!native + --!optimize 2
 ```
 
-Bnum is designed for simulator, incremental, clicker, economy, damage, upgrade, leaderboard, and other Roblox systems that need values far beyond normal finite Luau display ranges while keeping arithmetic lightweight.
+Bnum is designed for simulator, incremental, clicker, economy, damage, upgrade, leaderboard, progression, and other Roblox systems that need magnitudes far beyond ordinary finite Luau numbers.
 
-v1.4.0 keeps the optimized lowercase API intact and adds a complete PascalCase convenience layer. The new convenience functions automatically convert supported `number`, `string`, and Bnum-like table inputs so call sites no longer need to wrap every argument in `Bnum.convert(...)`.
+v1.6.0 keeps the canonical log-space representation, the v1.5 string model, and the current leaderboard codec, then rebuilds the math internals around a **fast-path / hard-path kernel**. Common finite arithmetic stays directly inside the public hot functions, while rare NaN, infinity, zero, cancellation, and extreme-value cases share private raw kernels instead of duplicating hundreds of lines of logic.
 
 ---
 
 ## Highlights
 
 - Compact `{sign, logMagnitude}` canonical representation.
-- Numbers far beyond normal finite Luau range.
+- Values far beyond ordinary finite Luau magnitude.
 - Positive values, negative values, zero, infinity, negative infinity, and NaN.
-- 122 lowercase core APIs for direct/hot-path work.
-- 123 PascalCase convenience APIs for automatic input conversion.
-- `Bnum.SubZ(...)` for subtract-and-clamp-to-zero behavior.
-- Direct Bnum + number arithmetic.
+- 127 lowercase core APIs for direct/hot-path work.
+- 128 PascalCase convenience APIs for automatic input conversion.
+- Dedicated fast-path and hard-path arithmetic architecture.
+- Private raw kernels for addition, multiplication, division, and comparison.
+- Reduced temporary allocations in higher-level math.
 - Allocation-saving `*Into` APIs.
-- PascalCase `*Into` wrappers that convert inputs while reusing the output table.
-- Fused `mulAdd` / `addMul` and `MulAdd` / `AddMul`.
-- Square, cube, arbitrary roots, powers, logarithms, exponentials, and factorial.
-- Decimal, scientific, and suffix string parsing.
+- Direct Bnum + normal-number arithmetic.
+- Fused `mulAdd` and `addMul` operations.
+- Specialized `powInteger`, `midpoint`, `geometricMean`, `quadraticMean`, and `saturate`.
+- Conventional scientific `toString()` plus canonical-log `toBnumString()`.
+- `fromString()` parses decimal, scientific, suffix, Bnum-style exponent, infinity, and NaN forms.
+- Safe-integer leaderboard codec with `lbencode` / `lbdecode`.
 - Standard suffix ladder through tier `999`.
-- High exponent formatting such as `E100UCe` instead of nested `E1e308`.
+- High-exponent formatting such as `E100UCe`.
 - Extended, hybrid, alphabetic, metric, exponent, scientific, engineering, Roman, plain, comma, logarithm, and raw formatting.
-- `--!native` and `--!optimize 2`.
+- `--!native`.
+- `--!optimize 2`.
 
 ---
 
 # Installation
 
-Place the ModuleScript somewhere accessible to your game code. A common layout is:
+Place the module somewhere accessible to your game code.
+
+A common layout is:
 
 ```text
 ReplicatedStorage
@@ -55,7 +61,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Bnum = require(ReplicatedStorage:WaitForChild("Bnum"))
 
 print(Bnum.Version)
--- 1.4.0
+-- 1.6.0
 ```
 
 ---
@@ -64,7 +70,7 @@ print(Bnum.Version)
 
 ## Convenience API
 
-For normal game code, v1.4.0 can convert supported inputs for you:
+For ordinary game code, the PascalCase layer converts supported inputs automatically:
 
 ```lua
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -90,7 +96,7 @@ print(Bnum.ToNumber(c)) -- 60
 print(Bnum.ToNumber(d)) -- 25
 ```
 
-`SubZ` clamps negative subtraction results to zero:
+`SubZ` subtracts and clamps negative results to zero:
 
 ```lua
 print(Bnum.ToNumber(Bnum.SubZ(100, 25))) -- 75
@@ -99,7 +105,7 @@ print(Bnum.ToNumber(Bnum.SubZ(5, 10)))   -- 0
 
 ## Core API
 
-The lowercase API remains unchanged and is still the preferred form when your values are already canonical Bnums:
+When values are already canonical Bnums, use the lowercase layer:
 
 ```lua
 local coins = Bnum.fromNumber(1000)
@@ -114,7 +120,7 @@ print(Bnum.format(coins, 2))
 
 # Two API Layers
 
-v1.4.0 intentionally exposes two layers.
+v1.6 intentionally exposes two public layers.
 
 ## Lowercase core API
 
@@ -124,16 +130,12 @@ Examples:
 Bnum.add(a, b)
 Bnum.mul(a, b)
 Bnum.sqrt(value)
+Bnum.midpoint(a, b)
 Bnum.format(value, 2)
 Bnum.addInto(out, a, b)
 ```
 
-Use the lowercase API when:
-
-- inputs are already Bnums,
-- code is inside a hot loop,
-- you want the least conversion overhead,
-- or you need maximum control over allocations.
+Use the lowercase layer when values are already Bnums, when code is in a hot loop, or when conversion/allocation overhead matters.
 
 ## PascalCase convenience API
 
@@ -143,21 +145,13 @@ Examples:
 Bnum.Add(10, "25")
 Bnum.Mul("1e100", 2)
 Bnum.Sqrt("144")
+Bnum.Midpoint(10, "20")
 Bnum.Eq(1000, "1e3")
 Bnum.Format("1.25M", 2)
 Bnum.AddInto(out, 10, "25")
 ```
 
-Use the PascalCase API when:
-
-- values may arrive as numbers, strings, or Bnum-like tables,
-- cleaner call sites matter more than conversion overhead,
-- data comes from configs, UI, DataStores, or external systems,
-- or you do not want to repeatedly write `Bnum.convert(...)`.
-
-Most value-taking PascalCase functions use the internal convenience converter. Unsupported values become NaN instead of causing the wrapper to immediately index `nil`.
-
-`Bnum.Convert(...)` itself intentionally mirrors the lowercase `Bnum.convert(...)` contract and can still return `nil` for unsupported input types.
+Use the convenience layer at input boundaries such as configs, UI text, DataStores, or general game logic where mixed `number`, `string`, and Bnum-like inputs are useful.
 
 ---
 
@@ -188,7 +182,7 @@ Examples:
 | `-1000` | `{-1, 3}` |
 | `1e1000` | `{1, 1000}` |
 
-This keeps enormous magnitudes compact. `1e1000` does not require one thousand decimal digits internally; the magnitude is represented by the log value `1000`.
+This representation makes huge multiplication, division, roots, powers, comparisons, and scaling inexpensive because the stored magnitude is already logarithmic.
 
 ---
 
@@ -216,11 +210,10 @@ print(pair[1], pair[2])
 -- approximately: 9.5  3
 ```
 
-The PascalCase equivalents are also available:
+That value is `9500`, whose canonical storage is approximately:
 
 ```lua
-local value = Bnum.FromTable({9.5, 3})
-local pair = Bnum.ToTable(value)
+{1, 3.9777236052888477}
 ```
 
 ---
@@ -240,7 +233,7 @@ Bnum.pow10(5000)
 Bnum.fromString("1.25M")
 ```
 
-Convenience names:
+Convenience equivalents:
 
 ```lua
 Bnum.New(9.5, 3)
@@ -253,24 +246,10 @@ Bnum.Pow10(5000)
 Bnum.FromString("1.25M")
 ```
 
-Supported string examples:
+Do not create a huge native value before handing it to Bnum:
 
 ```lua
-Bnum.FromString("1000")
-Bnum.FromString("123.456")
-Bnum.FromString("1e250")
-Bnum.FromString("-5.25e100")
-Bnum.FromString("1.25M")
-Bnum.FromString("5Qa")
-Bnum.FromString("inf")
-Bnum.FromString("-inf")
-Bnum.FromString("nan")
-```
-
-Do not create huge native values first:
-
-```lua
--- Wrong: native overflow happens before Bnum receives the value.
+-- Wrong: native overflow happens first.
 Bnum.FromNumber(10 ^ 1000)
 
 -- Correct:
@@ -280,117 +259,302 @@ Bnum.FromString("1e1000")
 
 ---
 
-# Convenience Arithmetic
+# String Parsing and Serialization
 
-The major convenience arithmetic functions are:
+v1.6 keeps the v1.5 split between **normal scientific strings** and **Bnum-storage strings**.
+
+## `toString`
+
+`toString()` returns conventional normalized scientific notation with an integer exponent:
 
 ```lua
-Bnum.Add(a, b)
-Bnum.Sub(a, b)
-Bnum.SubZ(a, b)
-Bnum.Mul(a, b)
-Bnum.Div(a, b)
+local value = Bnum.new(9.5, 3)
 
-Bnum.AddNumber(value, number)
-Bnum.SubNumber(value, number)
-Bnum.MulNumber(value, number)
-Bnum.DivNumber(value, number)
-
-Bnum.Scale10(value, exponent)
-Bnum.Square(value)
-Bnum.Cube(value)
-
-Bnum.MulAdd(a, b, c)
-Bnum.AddMul(a, b, c)
-
-Bnum.Reciprocal(value)
-Bnum.Pow(value, power)
-Bnum.Sqrt(value)
-Bnum.Cbrt(value)
-Bnum.Root(value, degree)
-Bnum.Abs(value)
-Bnum.Neg(value)
+print(Bnum.toString(value))
+-- 9.5e3
 ```
 
-Examples:
+The PascalCase version is:
 
 ```lua
-local total = Bnum.Add("1e100", "2e100")
-local damage = Bnum.MulAdd(25, 15, 100)
-local root = Bnum.Sqrt("144")
-local clamped = Bnum.SubZ(5, 10)
+Bnum.ToString(value)
+```
 
-print(Bnum.Format(total, 2))
-print(Bnum.ToNumber(damage))  -- 475
-print(Bnum.ToNumber(root))    -- 12
-print(Bnum.ToNumber(clamped)) -- 0
+## `toBnumString`
+
+`toBnumString()` preserves the stored logarithmic exponent:
+
+```lua
+local value = Bnum.new(9.5, 3)
+
+print(Bnum.toBnumString(value))
+-- 1e3.9777236052888477
+```
+
+Negative example:
+
+```lua
+print(Bnum.toBnumString(Bnum.new(-9.5, 3)))
+-- -1e3.9777236052888477
+```
+
+The PascalCase version is:
+
+```lua
+Bnum.ToBnumString(value)
+```
+
+## `fromString`
+
+`fromString()` understands both formats:
+
+```lua
+Bnum.fromString("9.5e3")
+Bnum.fromString("1e3.9777236052888477")
+```
+
+Both represent `9500`.
+
+It also supports:
+
+```lua
+Bnum.fromString("1000")
+Bnum.fromString("123.456")
+Bnum.fromString("1e250")
+Bnum.fromString("1e3.5")
+Bnum.fromString("1e1e6")
+Bnum.fromString("-5.25e100")
+Bnum.fromString("1.25M")
+Bnum.fromString("2 Million")
+Bnum.fromString("inf")
+Bnum.fromString("-inf")
+Bnum.fromString("nan")
+```
+
+For very large stored log exponents, Bnum-style text may itself contain scientific exponent text:
+
+```text
+1e1e+308
+```
+
+The parser accepts that form.
+
+---
+
+# Fast Path and Hard Path
+
+v1.6 restructures the arithmetic internals around two execution paths.
+
+## Fast path
+
+The common finite/canonical cases stay directly inside the public functions.
+
+Examples include:
+
+```text
+finite nonzero multiplication
+finite nonzero division
+same-sign addition
+far-magnitude addition
+normal scalar multiplication/division
+```
+
+This keeps hot operations short and avoids an extra public helper call.
+
+## Hard path
+
+Rare cases use private raw kernels:
+
+```text
+rawAddHard
+rawAdd
+rawMul
+rawDiv
+rawCompare
+```
+
+These handle:
+
+```text
+NaN
+positive/negative infinity
+zero
+mixed signs
+close cancellation
+division by zero
+underflow
+unordered comparison
+```
+
+Higher-level math also reuses the raw kernels, so functions such as `lerp`, `remap`, `mean`, and `percentChange` no longer carry large duplicated copies of add/subtract logic.
+
+---
+
+# Core Arithmetic
+
+```lua
+local a = Bnum.fromNumber(500)
+local b = Bnum.fromNumber(250)
+
+print(Bnum.format(Bnum.add(a, b))) -- 750
+print(Bnum.format(Bnum.sub(a, b))) -- 250
+print(Bnum.format(Bnum.mul(a, b)))
+print(Bnum.format(Bnum.div(a, b)))
+```
+
+## Direct Bnum + Number Operations
+
+When one operand is already a normal Luau number:
+
+```lua
+local value = Bnum.fromNumber(100)
+
+value = Bnum.addNumber(value, 25)
+value = Bnum.subNumber(value, 5)
+value = Bnum.mulNumber(value, 1.5)
+value = Bnum.divNumber(value, 2)
+```
+
+This avoids allocating a temporary Bnum for the scalar operand.
+
+## Scale, Square, Cube, and Fused Math
+
+```lua
+local scaled = Bnum.scale10(Bnum.fromNumber(9.5), 10)
+local squared = Bnum.square(Bnum.fromNumber(12))
+local cubed = Bnum.cube(Bnum.fromNumber(5))
+
+local damage = Bnum.mulAdd(
+	Bnum.fromNumber(25),
+	Bnum.fromNumber(15),
+	Bnum.fromNumber(100)
+)
+```
+
+`mulAdd(a, b, c)` computes:
+
+```text
+a × b + c
+```
+
+`addMul(a, b, c)` computes:
+
+```text
+a + b × c
 ```
 
 ---
 
-# Advanced Math
+# Powers, Roots, Logs, and Exponentials
 
-Both layers expose logarithmic and exponential helpers:
-
-```lua
-Bnum.Log10(value)
-Bnum.Ln(value)
-Bnum.Log2(value)
-Bnum.Log(value, base)
-
-Bnum.Exp(value)
-Bnum.Exp10(value)
-Bnum.Exp2(value)
-
-Bnum.PowValue(value, power)
-Bnum.Log1p(value)
-Bnum.Expm1(value)
-Bnum.Hypot(a, b)
-Bnum.Factorial(value)
-```
-
-Example:
+Core functions include:
 
 ```lua
-print(Bnum.ToNumber(Bnum.Log10(1000))) -- 3
-print(Bnum.ToNumber(Bnum.Log2(1024)))  -- 10
-print(Bnum.ToNumber(Bnum.Exp10(3)))    -- 1000
-print(Bnum.ToNumber(Bnum.Hypot(3, 4))) -- 5
+Bnum.pow(value, power)
+Bnum.powInteger(value, integerPower)
+Bnum.powValue(value, powerValue)
+
+Bnum.sqrt(value)
+Bnum.cbrt(value)
+Bnum.root(value, degree)
+
+Bnum.log10(value)
+Bnum.ln(value)
+Bnum.log2(value)
+Bnum.log(value, base)
+
+Bnum.exp(value)
+Bnum.exp10(value)
+Bnum.exp2(value)
+
+Bnum.log1p(value)
+Bnum.expm1(value)
+Bnum.hypot(a, b)
+Bnum.factorial(value)
 ```
+
+## `powInteger`
+
+`powInteger` is the specialized integer exponent path:
+
+```lua
+print(Bnum.ToNumber(Bnum.PowInteger("-2", 3))) -- -8
+print(Bnum.ToNumber(Bnum.PowInteger("-2", 4))) -- 16
+```
+
+Fractional powers are rejected by this API:
+
+```lua
+Bnum.powInteger(Bnum.fromNumber(2), 2.5)
+-- NaN
+```
+
+Use `pow()` for general numeric exponents.
+
+---
+
+# New v1.6 Math Helpers
+
+## `midpoint`
+
+Returns `(a + b) / 2` using one raw addition and a fixed `log10(2)` shift:
+
+```lua
+print(Bnum.ToNumber(Bnum.Midpoint(10, "20")))
+-- 15
+```
+
+## `geometricMean`
+
+Returns the real geometric mean:
+
+```lua
+print(Bnum.ToNumber(Bnum.GeometricMean(4, 16)))
+-- 8
+```
+
+Negative real inputs return NaN.
+
+## `quadraticMean`
+
+Returns the quadratic mean / RMS:
+
+```lua
+local rms = Bnum.QuadraticMean(3, 4)
+print(Bnum.ToNumber(rms))
+-- sqrt((3^2 + 4^2) / 2)
+```
+
+## `saturate`
+
+Clamps a value to `[0, 1]`:
+
+```lua
+print(Bnum.ToNumber(Bnum.Saturate(-5)))   -- 0
+print(Bnum.ToNumber(Bnum.Saturate(0.25))) -- 0.25
+print(Bnum.ToNumber(Bnum.Saturate(5)))    -- 1
+```
+
+This is useful for normalized progress, UI fill values, interpolation parameters, and similar game math.
 
 ---
 
 # Comparison and Selection
 
-Convenience comparisons accept mixed supported values:
-
 ```lua
-Bnum.Compare(a, b)
+local a = Bnum.fromNumber(100)
+local b = Bnum.fromNumber(250)
 
-Bnum.Eq(a, b)
-Bnum.Neq(a, b)
-Bnum.Lt(a, b)
-Bnum.Lte(a, b)
-Bnum.Gt(a, b)
-Bnum.Gte(a, b)
-
-Bnum.Min(a, b, ...)
-Bnum.Max(a, b, ...)
-Bnum.Clamp(value, minimum, maximum)
+print(Bnum.compare(a, b)) -- -1
+print(Bnum.eq(a, b))
+print(Bnum.neq(a, b))
+print(Bnum.lt(a, b))
+print(Bnum.lte(a, b))
+print(Bnum.gt(a, b))
+print(Bnum.gte(a, b))
 ```
 
-Examples:
-
-```lua
-print(Bnum.Eq(1000, "1e3")) -- true
-print(Bnum.Lt("5", 10))     -- true
-
-local smallest = Bnum.Min(10, "2", 5)
-local largest = Bnum.Max(10, "2", 5)
-local clamped = Bnum.Clamp("15", 0, "10")
-```
-
-`Bnum.Compare(a, b)` returns:
+`compare()` returns:
 
 ```text
 -1   a < b
@@ -399,56 +563,85 @@ local clamped = Bnum.Clamp("15", 0, "10")
 nil  comparison contains NaN
 ```
 
+Selection helpers:
+
+```lua
+Bnum.min(a, b, c)
+Bnum.max(a, b, c)
+Bnum.clamp(value, minimum, maximum)
+```
+
 ---
 
 # Rounding, Range, and Utility Math
 
-Convenience helpers include:
-
 ```lua
-Bnum.Floor(value)
-Bnum.Ceil(value)
-Bnum.Round(value, digits?)
-Bnum.Mod(a, b)
-Bnum.Trunc(value)
-Bnum.Fract(value)
+Bnum.floor(value)
+Bnum.ceil(value)
+Bnum.round(value, digits?)
+Bnum.mod(a, b)
+Bnum.trunc(value)
+Bnum.fract(value)
 
-Bnum.IsInteger(value)
-Bnum.Between(value, minimum, maximum)
+Bnum.isInteger(value)
+Bnum.between(value, minimum, maximum)
 
-Bnum.Distance(a, b)
-Bnum.RelativeDifference(a, b)
-Bnum.ApproxEq(a, b, relTolerance?, absTolerance?)
+Bnum.distance(a, b)
+Bnum.relativeDifference(a, b)
+Bnum.approxEq(a, b, relTolerance?, absTolerance?)
 
-Bnum.Lerp(a, b, alpha)
-Bnum.InverseLerp(a, b, value)
-Bnum.Remap(value, inMin, inMax, outMin, outMax)
+Bnum.lerp(a, b, alpha)
+Bnum.inverseLerp(a, b, value)
+Bnum.remap(value, inMin, inMax, outMin, outMax)
 
-Bnum.Sum(values)
-Bnum.Product(values)
-Bnum.Mean(values)
+Bnum.sum(values)
+Bnum.product(values)
+Bnum.mean(values)
 
-Bnum.Percent(part, whole)
-Bnum.PercentChange(oldValue, newValue)
+Bnum.percent(part, whole)
+Bnum.percentChange(oldValue, newValue)
 ```
 
-Array helpers convert every element:
+## Allocation-aware array math
+
+`sum()` and `mean()` keep their running accumulator as two numeric locals:
+
+```text
+accSign
+accLogMagnitude
+```
+
+They use the raw add kernel during the loop and allocate only the final result Bnum.
+
+Example:
 
 ```lua
-local total = Bnum.Sum({1, "2", 3, "4"})
-local product = Bnum.Product({2, "3", 4})
-local average = Bnum.Mean({2, "4", 6})
+local values = {
+	Bnum.fromNumber(1),
+	Bnum.fromNumber(2),
+	Bnum.fromNumber(3),
+	Bnum.fromNumber(4),
+}
 
-print(Bnum.ToNumber(total))   -- 10
-print(Bnum.ToNumber(product)) -- 24
-print(Bnum.ToNumber(average)) -- 4
+print(Bnum.ToNumber(Bnum.sum(values)))  -- 10
+print(Bnum.ToNumber(Bnum.mean(values))) -- 2.5
 ```
 
 ---
 
 # Value Checks
 
-Convenience checks accept supported mixed inputs:
+```lua
+Bnum.isZero(value)
+Bnum.isNaN(value)
+Bnum.isInfinite(value)
+Bnum.isFinite(value)
+Bnum.isPositive(value)
+Bnum.isNegative(value)
+Bnum.sign(value)
+```
+
+Convenience equivalents accept supported mixed inputs:
 
 ```lua
 Bnum.IsZero(value)
@@ -460,30 +653,11 @@ Bnum.IsNegative(value)
 Bnum.Sign(value)
 ```
 
-Examples:
-
-```lua
-print(Bnum.IsPositive("5")) -- true
-print(Bnum.IsNegative(-5))  -- true
-print(Bnum.Sign("-5"))      -- -1
-```
-
 ---
 
 # Formatting
 
-v1.4.0 keeps the v1.3.3 formatting system and exposes both lowercase and PascalCase entry points.
-
-Defaults:
-
-```text
-Default format:     standard
-Default precision:  2 decimal places
-Maximum precision:  8 decimal places
-E-notation start:   3000
-```
-
-Primary format names:
+v1.6 uses canonical lowercase format names only:
 
 ```text
 standard
@@ -502,39 +676,52 @@ logarithm
 raw
 ```
 
+Defaults:
+
+```text
+Default format:     standard
+Default precision:  2 decimal places
+Maximum precision:  8 decimal places
+E-notation start:   3000
+Precision mode:     decimal-places
+```
+
+Main formatter:
+
+```lua
+Bnum.format(value, decimalPlaces?, formatType?)
+```
+
 Examples:
 
 ```lua
-local value = "1.2345e12"
+local value = Bnum.fromString("1.2345e12")
 
-print(Bnum.Format(value))
-print(Bnum.Format(value, 2))
-print(Bnum.Format(value, 2, "standard"))
-print(Bnum.Format(value, 2, "scientific"))
-print(Bnum.Format(value, 2, "engineering"))
-print(Bnum.Format(value, 2, "comma"))
+print(Bnum.format(value))
+print(Bnum.format(value, 2))
+print(Bnum.format(value, 2, "standard"))
+print(Bnum.format(value, 2, "scientific"))
+print(Bnum.format(value, 2, "engineering"))
+print(Bnum.format(value, 2, "comma"))
 ```
 
-Dedicated convenience formatters include:
+Dedicated formatters:
 
 ```lua
-Bnum.FormatStandard(value, digits?)
-Bnum.FormatExtended(value, digits?)
-Bnum.FormatHybrid(value, digits?)
-Bnum.FormatAlphabetic(value, digits?)
-Bnum.FormatMetric(value, digits?)
-Bnum.FormatExponent(value, digits?)
-Bnum.FormatScientific(value, digits?)
-Bnum.FormatEngineering(value, digits?)
-Bnum.FormatRoman(value, digits?)
-Bnum.FormatRomanExtended(value, digits?)
-Bnum.FormatSuffix(value, digits?)
-Bnum.FormatSuffixLong(value, digits?)
-Bnum.FormatPlain(value, digits?)
-Bnum.FormatComma(value, digits?)
-Bnum.FormatLogarithm(value, digits?)
-Bnum.FormatRaw(value)
-Bnum.AutoFormat(value, digits?, options?)
+Bnum.formatStandard(value, digits?)
+Bnum.formatExtended(value, digits?)
+Bnum.formatHybrid(value, digits?)
+Bnum.formatAlphabetic(value, digits?)
+Bnum.formatMetric(value, digits?)
+Bnum.formatExponent(value, digits?)
+Bnum.formatScientific(value, digits?)
+Bnum.formatEngineering(value, digits?)
+Bnum.formatRoman(value, digits?)
+Bnum.formatRomanExtended(value, digits?)
+Bnum.formatPlain(value, digits?)
+Bnum.formatComma(value, digits?)
+Bnum.formatLogarithm(value, digits?)
+Bnum.formatRaw(value)
 ```
 
 ## High exponent suffix formatting
@@ -549,7 +736,7 @@ tier 102 -> UCe
 tier 103 -> DCe
 ```
 
-That keeps exponent displays compact:
+That allows compact exponent displays:
 
 ```text
 logMagnitude = 1e305 -> E100Ce
@@ -558,23 +745,77 @@ logMagnitude = 1e307 -> E10UCe
 logMagnitude = 1e308 -> E100UCe
 ```
 
-instead of falling back to nested scientific text such as `E1e308`.
+instead of nested output such as `E1e308`.
+
+---
+
+# Removed Legacy Formatting APIs
+
+The following old compatibility functions are no longer part of the v1.6 public API:
+
+```text
+formatSuffix
+formatSuffixLong
+autoFormat
+
+FormatSuffix
+FormatSuffixLong
+AutoFormat
+```
+
+Use the canonical formatter functions instead:
+
+```text
+formatStandard / FormatStandard
+formatExtended / FormatExtended
+formatHybrid / FormatHybrid
+format / Format
+```
+
+Old capitalized format-name aliases such as `"Standard"`, `"Suffix"`, and `"Auto"` are also removed. Use the canonical lowercase format names.
 
 ---
 
 # Reusable Output / `Into`
 
-The lowercase `*Into` functions remain the fastest choice when inputs are already Bnums:
+Normal operations allocate a new two-number result table:
+
+```lua
+value = Bnum.add(value, reward)
+```
+
+For high-frequency loops, reuse an output table:
 
 ```lua
 local out = {0, 0}
 
-Bnum.addInto(out, a, b)
-Bnum.mulInto(out, a, b)
-Bnum.mulNumberInto(out, a, 1.15)
+Bnum.addInto(out, value, reward)
 ```
 
-v1.4.0 also adds PascalCase convenience wrappers:
+Available core reusable-output APIs:
+
+```lua
+Bnum.addInto(out, a, b)
+Bnum.subInto(out, a, b)
+Bnum.mulInto(out, a, b)
+Bnum.divInto(out, a, b)
+
+Bnum.powInto(out, value, power)
+
+Bnum.addNumberInto(out, value, number)
+Bnum.subNumberInto(out, value, number)
+Bnum.mulNumberInto(out, value, number)
+Bnum.divNumberInto(out, value, number)
+
+Bnum.scale10Into(out, value, exponent)
+Bnum.squareInto(out, value)
+Bnum.cubeInto(out, value)
+
+Bnum.mulAddInto(out, a, b, c)
+Bnum.addMulInto(out, a, b, c)
+```
+
+PascalCase wrappers convert the inputs but preserve the provided output table:
 
 ```lua
 local out = {0, 0}
@@ -584,19 +825,66 @@ Bnum.MulInto(out, "1e100", 2)
 Bnum.MulAddInto(out, 2, "3", 4)
 ```
 
-The output table is reused directly; only the value inputs are automatically converted.
+---
 
-For maximum throughput in a hot loop, prefer the lowercase form:
+# Leaderboard Encoding
+
+v1.6 keeps the current safe-integer leaderboard codec.
+
+Core API:
 
 ```lua
-local current = Bnum.fromString("1e100")
-local out = {0, 0}
-
-for _ = 1, 100000 do
-	Bnum.mulNumberInto(out, current, 1.01)
-	current, out = out, current
-end
+local encoded = Bnum.lbencode(value)
+local decoded = Bnum.lbdecode(encoded)
 ```
+
+Convenience API:
+
+```lua
+local encoded = Bnum.Lbencode("1e1000000")
+local decoded = Bnum.Lbdecode(encoded)
+```
+
+The codec transforms the stored `logMagnitude`:
+
+```text
+u = sign(logMagnitude) × log10(1 + abs(logMagnitude))
+```
+
+then quantizes that coordinate into an exact safe integer range below `2^52`.
+
+Public constants:
+
+```lua
+Bnum.LB_CODEC_VERSION
+Bnum.LB_SCALE
+Bnum.LB_CENTER_CODE
+Bnum.LB_MIN_FINITE_CODE
+Bnum.LB_MAX_FINITE_CODE
+Bnum.LB_INFINITY_CODE
+Bnum.LB_NAN_CODE
+```
+
+Current codec version:
+
+```text
+LB_CODEC_VERSION = 2
+LB_SCALE         = 4398046511104
+```
+
+Properties:
+
+```text
+sortable signed integer encoding
+zero -> 0
+positive infinity -> +LB_INFINITY_CODE
+negative infinity -> -LB_INFINITY_CODE
+NaN -> LB_NAN_CODE
+values below 1 remain distinct
+codes remain below 2^52
+```
+
+Legacy leaderboard decoding was removed in the v1.5 cleanup; `lbdecode()` accepts the current codec only.
 
 ---
 
@@ -604,18 +892,18 @@ end
 
 For fastest practical Bnum code:
 
-1. Keep values in canonical Bnum form during repeated calculations.
-2. Use the lowercase core API when inputs are already Bnums.
-3. Use PascalCase convenience APIs at boundaries where inputs may be numbers, strings, or public tables.
-4. Do not repeatedly auto-convert the same value inside a tight loop if you can convert it once.
-5. Prefer `addNumber`, `subNumber`, `mulNumber`, and `divNumber` when the second operand is already a normal number.
-6. Prefer `scale10`, `square`, and `cube` over composing generic operations.
-7. Use `mulAdd` and `addMul` when the formula matches.
-8. Use `*Into` functions where allocation pressure is measurable.
-9. Avoid formatting inside tight simulation loops; format when updating UI.
-10. Use `fromString`, `pow10`, or scientific constructors for magnitudes that cannot first exist as finite native numbers.
+1. Keep values canonical during repeated calculations.
+2. Use lowercase core functions when values are already Bnums.
+3. Convert once at input boundaries instead of repeatedly auto-converting inside hot loops.
+4. Prefer `addNumber`, `subNumber`, `mulNumber`, and `divNumber` when the other operand is a normal number.
+5. Prefer `scale10`, `square`, `cube`, `powInteger`, `midpoint`, and other specialized operations when they match the formula.
+6. Use `mulAdd` and `addMul` for matching fused formulas.
+7. Use `*Into` APIs when allocation pressure is measurable.
+8. Avoid formatting in simulation loops; format when UI actually updates.
+9. Use `fromString`, `pow10`, or scientific constructors for values that cannot exist as finite native numbers first.
+10. Benchmark in Roblox Studio before treating a source-level optimization as a measured speed win.
 
-The convenience layer prioritizes call-site ergonomics. It is not intended to replace the lowercase API in performance-critical loops.
+The PascalCase convenience layer prioritizes call-site ergonomics. It is not intended to replace the lowercase core API in the hottest loops.
 
 ---
 
@@ -640,7 +928,7 @@ for _ = 1, 10 do
 end
 ```
 
-For a hot click loop, keep the values canonical and use lowercase arithmetic:
+Hot-loop version:
 
 ```lua
 local coins = Bnum.zero
@@ -670,14 +958,11 @@ for level = 0, 10 do
 end
 ```
 
-A faster repeated-growth path can still use the lower-level number API:
+When the exponent is guaranteed to be an integer:
 
 ```lua
-local cost = Bnum.fromString("1e100")
-local growth = 1.15
-
-for _ = 1, 100 do
-	cost = Bnum.mulNumber(cost, growth)
+local function getIntegerUpgradeCost(level: number)
+	return Bnum.Mul(baseCost, Bnum.PowInteger(growth, level))
 end
 ```
 
@@ -691,19 +976,35 @@ local maximum = "1e100"
 local current = "5e99"
 
 local alpha = Bnum.InverseLerp(minimum, maximum, current)
-local alphaNumber = Bnum.ToNumber(alpha)
+local normalized = Bnum.Saturate(alpha)
+local alphaNumber = Bnum.ToNumber(normalized)
 
-progressBar.Size = UDim2.fromScale(
-	math.clamp(alphaNumber, 0, 1),
-	1
-)
+progressBar.Size = UDim2.fromScale(alphaNumber, 1)
 ```
+
+---
+
+# Example: DataStore / Leaderboard Flow
+
+```lua
+local score = Bnum.FromString("1e1000000")
+
+local storedScore = Bnum.Lbencode(score)
+
+-- Save storedScore to your ordered leaderboard storage.
+
+local restoredScore = Bnum.Lbdecode(storedScore)
+
+print(Bnum.Format(restoredScore, 2))
+```
+
+For normal DataStore persistence where ordering is not required, store an appropriate Bnum serialization for your own schema rather than assuming `lbencode()` is a lossless serializer.
 
 ---
 
 # Special Values
 
-Bnum includes immutable predefined values:
+Bnum includes:
 
 ```lua
 Bnum.zero
@@ -717,16 +1018,19 @@ Bnum.ninf
 Bnum.nan
 ```
 
-Check values with either API layer:
+Special arithmetic intentionally handles cases such as:
 
-```lua
-Bnum.isInfinite(value)
-Bnum.isNaN(value)
-Bnum.isFinite(value)
-
-Bnum.IsInfinite(value)
-Bnum.IsNaN(value)
-Bnum.IsFinite(value)
+```text
+0 × infinity -> NaN
+infinity / infinity -> NaN
++infinity + -infinity -> NaN
+1 / 0 -> +infinity
+1 / infinity -> 0
+0^-1 -> +infinity
+NaN^0 -> 1
+sqrt(-1) -> NaN
+root(-32, 5) -> -2
+root(-32, 4) -> NaN
 ```
 
 ---
@@ -747,13 +1051,13 @@ It is well suited for values such as:
 
 where useful magnitude and floating-point precision matter more than retaining every decimal digit.
 
-Bnum is not intended for cryptographic arithmetic or exact arbitrary-length integer accounting.
+For exact arbitrary-length integers, cryptographic arithmetic, or exact financial decimal accounting, use a representation designed for exact arithmetic.
 
 ---
 
 # Recommended Data Flow
 
-For convenience-oriented code:
+Convenience-oriented code:
 
 ```text
 DataStore / config / UI input
@@ -771,7 +1075,7 @@ Bnum.Format(...)
 player UI
 ```
 
-For performance-oriented code:
+Performance-oriented code:
 
 ```text
 input
@@ -780,7 +1084,9 @@ convert once
   ↓
 canonical Bnum
   ↓
-lowercase core / Into hot paths
+lowercase core / raw-kernel-backed hot paths
+  ↓
+Into API when allocation matters
   ↓
 format only when needed
 ```
@@ -789,8 +1095,7 @@ format only when needed
 
 # Core API Reference
 
-The lowercase API is the direct, performance-oriented layer.
-
+The lowercase layer is the direct, performance-oriented API.
 
 ## Construction and Conversion
 
@@ -809,26 +1114,26 @@ The lowercase API is the direct, performance-oriented layer.
 | `Bnum.fromScientific(man: number, exp: number): Value` | Creates a Bnum from scientific mantissa × 10^exponent form. |
 | `Bnum.fromLog10(logMagnitude: number, sign: number?): Value` | Creates a Bnum directly from log10(abs(value)) and an optional sign. |
 | `Bnum.pow10(exp: number): Value` | Creates 10 raised to a normal numeric exponent. |
-| `Bnum.fromString(str: string): Value` | Parses decimal, scientific, infinity, NaN, and supported suffix strings. |
+| `Bnum.fromString(str: string): Value` | Parses decimal, scientific, Bnum-style exponent, infinity, NaN, and suffix strings. |
 | `Bnum.toNumber(val: Value): number` | Converts a Bnum back to a normal Luau number when representable. |
 | `Bnum.toScientific(val: Value): (number, number)` | Returns a normal scientific mantissa and exponent pair. |
 | `Bnum.mantissa(val: Value): number` | Returns the signed scientific mantissa of a Bnum. |
 | `Bnum.exponent(val: Value): number` | Returns the base-10 scientific exponent of a Bnum. |
-| `Bnum.toString(val: Value): string` |  |
-
+| `Bnum.toString(val: Value): string` | Serializes a Bnum using conventional normalized scientific notation. |
+| `Bnum.toBnumString(val: Value): string` | Serializes the Bnum using its stored logarithmic exponent. |
 
 ## Core Arithmetic
 
 | Function | Purpose |
 | --- | --- |
-| `Bnum.add(val1: Value, val2: Value): Value` | Adds two Bnums using direct log-space arithmetic. |
-| `Bnum.sub(val1: Value, val2: Value): Value` | Subtracts the second Bnum from the first using direct log-space arithmetic. |
-| `Bnum.mul(val1: Value, val2: Value): Value` | Multiplies two Bnums by multiplying signs and adding log magnitudes. |
-| `Bnum.div(val1: Value, val2: Value): Value` | Divides the first Bnum by the second using direct log-space arithmetic. |
-| `Bnum.addNumber(val: Value, n: number): Value` | Adds a normal Luau number directly to a Bnum without creating a temporary Bnum. |
+| `Bnum.add(val1: Value, val2: Value): Value` | Adds two canonical Bnums. |
+| `Bnum.sub(val1: Value, val2: Value): Value` | Subtracts the second Bnum from the first. |
+| `Bnum.mul(val1: Value, val2: Value): Value` | Multiplies two Bnums. |
+| `Bnum.div(val1: Value, val2: Value): Value` | Divides the first Bnum by the second. |
+| `Bnum.addNumber(val: Value, n: number): Value` | Adds a normal Luau number directly to a Bnum. |
 | `Bnum.subNumber(val: Value, n: number): Value` | Subtracts a normal Luau number directly from a Bnum. |
-| `Bnum.mulNumber(val: Value, n: number): Value` | Multiplies a Bnum directly by a normal Luau number. |
-| `Bnum.divNumber(val: Value, n: number): Value` | Divides a Bnum directly by a normal Luau number. |
+| `Bnum.mulNumber(val: Value, n: number): Value` | Multiplies a Bnum by a normal number without allocating a temporary Bnum. |
+| `Bnum.divNumber(val: Value, n: number): Value` | Divides a Bnum by a normal number without allocating a temporary Bnum. |
 | `Bnum.scale10(val: Value, exponent: number): Value` | Multiplies a Bnum by 10^exponent by shifting its log magnitude. |
 | `Bnum.square(val: Value): Value` | Squares a Bnum using the direct log identity log10(x²) = 2 log10(x). |
 | `Bnum.cube(val: Value): Value` | Cubes a Bnum using the direct log identity log10(x³) = 3 log10(x). |
@@ -842,8 +1147,7 @@ The lowercase API is the direct, performance-oriented layer.
 | `Bnum.abs(val: Value): Value` | Returns the absolute value of a Bnum. |
 | `Bnum.neg(val: Value): Value` | Negates the sign of a Bnum. |
 
-
-## Logs, Exponentials, and Advanced Math
+## Logs, Exponentials, and Specialized Math
 
 | Function | Purpose |
 | --- | --- |
@@ -859,7 +1163,11 @@ The lowercase API is the direct, performance-oriented layer.
 | `Bnum.expm1(val: Value): Value` | Computes e^x - 1 with extra care for tiny x values. |
 | `Bnum.hypot(a: Value, b: Value): Value` | Computes sqrt(a² + b²) in Bnum space. |
 | `Bnum.factorial(val: Value): Value` | Computes n! for non-negative integer Bnum inputs. |
-
+| `Bnum.powInteger(val: Value, power: number): Value` | Raises a Bnum to an integer power. |
+| `Bnum.midpoint(a: Value, b: Value): Value` | Returns the arithmetic midpoint `(a + b) / 2`. |
+| `Bnum.geometricMean(a: Value, b: Value): Value` | Returns the real geometric mean `sqrt(a * b)`. |
+| `Bnum.quadraticMean(a: Value, b: Value): Value` | Returns the quadratic mean / RMS of two Bnums: |
+| `Bnum.saturate(val: Value): Value` | Clamps a Bnum to the inclusive range [0, 1]. |
 
 ## Comparison and Selection
 
@@ -874,8 +1182,7 @@ The lowercase API is the direct, performance-oriented layer.
 | `Bnum.gte(val1: Value, val2: Value): boolean` | Returns true when the first Bnum is greater than or equal to the second. |
 | `Bnum.min(val1: Value, val2: Value?, ...: Value): Value` | Returns the smallest Bnum from the supplied values. |
 | `Bnum.max(val1: Value, val2: Value?, ...: Value): Value` | Returns the largest Bnum from the supplied values. |
-| `Bnum.clamp(val: Value, minimum: Value, maximum: Value): Value` | Clamps a Bnum between a minimum and maximum value. |
-
+| `Bnum.clamp(val: Value, minimum: Value, maximum: Value): Value` | Clamps a Bnum between minimum and maximum. |
 
 ## Rounding, Range, and Utility Math
 
@@ -890,17 +1197,16 @@ The lowercase API is the direct, performance-oriented layer.
 | `Bnum.isInteger(val: Value): boolean` | Checks whether a finite Bnum represents an exact integer in the supported precision range. |
 | `Bnum.between(val: Value, minimum: Value, maximum: Value): boolean` | Checks whether a Bnum lies inclusively between two bounds. |
 | `Bnum.distance(a: Value, b: Value): Value` | Returns the absolute distance between two Bnums. |
-| `Bnum.relativeDifference(a: Value, b: Value): Value` | Returns the absolute difference relative to the larger absolute input. |
-| `Bnum.approxEq(a: Value, b: Value, relTolerance: number?, absTolerance: number?): boolean` | Checks approximate equality using relative and absolute tolerances. |
-| `Bnum.lerp(a: Value, b: Value, alpha: number): Value` | Linearly interpolates between two Bnums using a normal numeric alpha. |
-| `Bnum.inverseLerp(a: Value, b: Value, val: Value): Value` | Returns the interpolation alpha of a value between two Bnum endpoints. |
-| `Bnum.remap(val: Value, inMin: Value, inMax: Value, outMin: Value, outMax: Value): Value` | Maps a Bnum from one numeric range into another range. |
-| `Bnum.sum(values: {Value}): Value` | Adds every Bnum in an array using an inline accumulator. |
+| `Bnum.relativeDifference(a: Value, b: Value): Value` | Returns \|a - b\| / max(\|a\|, \|b\|). |
+| `Bnum.approxEq(a: Value, b: Value, relTolerance: number?, absTolerance: number?): boolean` | Checks approximate equality with relative and absolute tolerances. |
+| `Bnum.lerp(a: Value, b: Value, alpha: number): Value` | Linearly interpolates between two Bnums: |
+| `Bnum.inverseLerp(a: Value, b: Value, val: Value): Value` | Returns the interpolation alpha of val between a and b: |
+| `Bnum.remap(val: Value, inMin: Value, inMax: Value, outMin: Value, outMax: Value): Value` | Remaps val from [inMin, inMax] into [outMin, outMax]. |
+| `Bnum.sum(values: {Value}): Value` | Adds every Bnum in an array. |
 | `Bnum.product(values: {Value}): Value` | Multiplies every Bnum in an array using an inline accumulator. |
-| `Bnum.mean(values: {Value}): Value` | Returns the arithmetic mean of all Bnums in an array. |
+| `Bnum.mean(values: {Value}): Value` | Returns the arithmetic mean of an array. |
 | `Bnum.percent(part: Value, whole: Value): Value` | Returns part / whole × 100 as a Bnum. |
-| `Bnum.percentChange(oldValue: Value, newValue: Value): Value` | Returns the percentage change from an old Bnum to a new Bnum. |
-
+| `Bnum.percentChange(oldValue: Value, newValue: Value): Value` | Returns ((newValue - oldValue) / abs(oldValue)) * 100. |
 
 ## Checks
 
@@ -913,7 +1219,6 @@ The lowercase API is the direct, performance-oriented layer.
 | `Bnum.isPositive(val: Value): boolean` | Checks whether a Bnum is strictly greater than zero. |
 | `Bnum.isNegative(val: Value): boolean` | Checks whether a Bnum is strictly less than zero. |
 | `Bnum.sign(val: Value): number` | Returns -1, 0, or 1 for the Bnum sign. |
-
 
 ## Formatting
 
@@ -933,14 +1238,10 @@ The lowercase API is the direct, performance-oriented layer.
 | `Bnum.formatEngineering(val: Value, decimalPlaces: number?): string` | Formats in engineering notation. |
 | `Bnum.formatRoman(val: Value, decimalPlaces: number?): string` | Formats exact integers as classical Roman numerals when possible. |
 | `Bnum.formatRomanExtended(val: Value, decimalPlaces: number?): string` | Formats exact integers with parenthesized extended Roman numerals. |
-| `Bnum.formatSuffix(val: Value, decimalPlaces: number?): string` | Legacy alias for the standard suffix formatter. |
-| `Bnum.formatSuffixLong(val: Value, decimalPlaces: number?): string` | Legacy long-name suffix formatter. |
 | `Bnum.formatPlain(val: Value, decimalPlaces: number?): string` | Formats as a fixed decimal when representable. |
 | `Bnum.formatComma(val: Value, decimalPlaces: number?): string` | Formats normal-sized values with comma grouping. |
 | `Bnum.formatLogarithm(val: Value, decimalPlaces: number?): string` | Formats as 10^logMagnitude. |
 | `Bnum.formatRaw(val: Value): string` | Returns the raw {sign, logMagnitude} representation. |
-| `Bnum.autoFormat(val: Value, digits: number?, options: AutoFormatOptions?): string` | Compatibility entry point. The NanoNum-style standard formatter is now the default. |
-
 
 ## Reusable Output / Into
 
@@ -961,15 +1262,20 @@ The lowercase API is the direct, performance-oriented layer.
 | `Bnum.mulAddInto(out: Value, a: Value, b: Value, c: Value): Value` | Computes a × b + c directly into an existing output table. |
 | `Bnum.addMulInto(out: Value, a: Value, b: Value, c: Value): Value` | Computes a + b × c directly into an existing output table. |
 
+## Leaderboard Codec
+
+| Function | Purpose |
+| --- | --- |
+| `Bnum.lbencode(val: Value): number` | Encodes a canonical Bnum into one sortable safe integer for leaderboard storage. |
+| `Bnum.lbdecode(encoded: number): Value` | Decodes a leaderboard number into canonical Bnum form. |
 
 ---
 
 # PascalCase Convenience API Reference
 
-The PascalCase layer keeps the same feature set while converting supported Bnum-value inputs automatically.
+The PascalCase layer converts supported Bnum-value inputs automatically.
 
-`SubZ` is the one additional convenience-only operation; it subtracts and clamps negative results to `Bnum.zero`.
-
+`SubZ` is the one convenience-only arithmetic operation; it subtracts and clamps negative results to zero.
 
 ## Construction and Conversion
 
@@ -994,7 +1300,7 @@ The PascalCase layer keeps the same feature set while converting supported Bnum-
 | `Bnum.Mantissa(value: any): number` | `Bnum.mantissa` | Returns the scientific mantissa for any supported input. |
 | `Bnum.Exponent(value: any): number` | `Bnum.exponent` | Returns the scientific exponent for any supported input. |
 | `Bnum.ToString(value: any): string` | `Bnum.toString` | Serializes any supported input to Bnum scientific text. |
-
+| `Bnum.ToBnumString(value: any): string` | `Bnum.toBnumString` | Serializes any supported input using the stored Bnum logarithmic exponent. |
 
 ## Core Arithmetic
 
@@ -1022,8 +1328,7 @@ The PascalCase layer keeps the same feature set while converting supported Bnum-
 | `Bnum.Abs(value: any): Value` | `Bnum.abs` | Returns the absolute value of any supported input. |
 | `Bnum.Neg(value: any): Value` | `Bnum.neg` | Negates any supported input. |
 
-
-## Logs, Exponentials, and Advanced Math
+## Logs, Exponentials, and Specialized Math
 
 | Convenience API | Core counterpart | Purpose |
 | --- | --- | --- |
@@ -1039,7 +1344,11 @@ The PascalCase layer keeps the same feature set while converting supported Bnum-
 | `Bnum.Expm1(value: any): Value` | `Bnum.expm1` | Computes e^value - 1 after converting the input automatically. |
 | `Bnum.Hypot(a: any, b: any): Value` | `Bnum.hypot` | Computes sqrt(a^2 + b^2) after converting both inputs automatically. |
 | `Bnum.Factorial(value: any): Value` | `Bnum.factorial` | Computes factorial(value) after converting the input automatically. |
-
+| `Bnum.PowInteger(value: any, power: number): Value` | `Bnum.powInteger` | Raises a supported value to an integer power using the specialized integer path. |
+| `Bnum.Midpoint(a: any, b: any): Value` | `Bnum.midpoint` | Returns the arithmetic midpoint of two supported values. |
+| `Bnum.GeometricMean(a: any, b: any): Value` | `Bnum.geometricMean` | Returns the real geometric mean of two supported non-negative values. |
+| `Bnum.QuadraticMean(a: any, b: any): Value` | `Bnum.quadraticMean` | Returns the quadratic mean / RMS of two supported values. |
+| `Bnum.Saturate(value: any): Value` | `Bnum.saturate` | Clamps a supported value to [0, 1]. |
 
 ## Comparison and Selection
 
@@ -1055,7 +1364,6 @@ The PascalCase layer keeps the same feature set while converting supported Bnum-
 | `Bnum.Min(a: any, b: any?, ...: any): Value` | `Bnum.min` | Returns the smallest converted input. |
 | `Bnum.Max(a: any, b: any?, ...: any): Value` | `Bnum.max` | Returns the largest converted input. |
 | `Bnum.Clamp(value: any, minimum: any, maximum: any): Value` | `Bnum.clamp` | Clamps value between minimum and maximum after converting all inputs automatically. |
-
 
 ## Rounding, Range, and Utility Math
 
@@ -1081,7 +1389,6 @@ The PascalCase layer keeps the same feature set while converting supported Bnum-
 | `Bnum.Percent(part: any, whole: any): Value` | `Bnum.percent` | Returns part / whole × 100 after converting both values automatically. |
 | `Bnum.PercentChange(oldValue: any, newValue: any): Value` | `Bnum.percentChange` | Returns percentage change from oldValue to newValue after automatic conversion. |
 
-
 ## Checks
 
 | Convenience API | Core counterpart | Purpose |
@@ -1093,7 +1400,6 @@ The PascalCase layer keeps the same feature set while converting supported Bnum-
 | `Bnum.IsPositive(value: any): boolean` | `Bnum.isPositive` | Checks whether a converted value is strictly positive. |
 | `Bnum.IsNegative(value: any): boolean` | `Bnum.isNegative` | Checks whether a converted value is strictly negative. |
 | `Bnum.Sign(value: any): number` | `Bnum.sign` | Returns -1, 0, or 1 for the sign of any supported input. |
-
 
 ## Formatting
 
@@ -1113,14 +1419,10 @@ The PascalCase layer keeps the same feature set while converting supported Bnum-
 | `Bnum.FormatEngineering(value: any, decimalPlaces: number?): string` | `Bnum.formatEngineering` | Formats any supported input using engineering notation. |
 | `Bnum.FormatRoman(value: any, decimalPlaces: number?): string` | `Bnum.formatRoman` | Formats any supported input using Roman numeral notation. |
 | `Bnum.FormatRomanExtended(value: any, decimalPlaces: number?): string` | `Bnum.formatRomanExtended` | Formats any supported input using extended Roman numeral notation. |
-| `Bnum.FormatSuffix(value: any, decimalPlaces: number?): string` | `Bnum.formatSuffix` | Formats any supported input using the short suffix notation. |
-| `Bnum.FormatSuffixLong(value: any, decimalPlaces: number?): string` | `Bnum.formatSuffixLong` | Formats any supported input using long suffix names. |
 | `Bnum.FormatPlain(value: any, decimalPlaces: number?): string` | `Bnum.formatPlain` | Formats any supported input as a plain decimal string when practical. |
 | `Bnum.FormatComma(value: any, decimalPlaces: number?): string` | `Bnum.formatComma` | Formats any supported input with comma grouping. |
 | `Bnum.FormatLogarithm(value: any, decimalPlaces: number?): string` | `Bnum.formatLogarithm` | Formats any supported input using logarithmic notation. |
 | `Bnum.FormatRaw(value: any): string` | `Bnum.formatRaw` | Formats any supported input as its raw Bnum representation. |
-| `Bnum.AutoFormat(value: any, digits: number?, options: AutoFormatOptions?): string` | `Bnum.autoFormat` | Automatically selects a suitable notation for any supported input. |
-
 
 ## Reusable Output / Into
 
@@ -1141,10 +1443,16 @@ The PascalCase layer keeps the same feature set while converting supported Bnum-
 | `Bnum.MulAddInto(out: Value, a: any, b: any, c: any): Value` | `Bnum.mulAddInto` | Computes a × b + c from converted inputs directly into out. |
 | `Bnum.AddMulInto(out: Value, a: any, b: any, c: any): Value` | `Bnum.addMulInto` | Computes a + b × c from converted inputs directly into out. |
 
+## Leaderboard Codec
+
+| Convenience API | Core counterpart | Purpose |
+| --- | --- | --- |
+| `Bnum.Lbencode(value: any): number` | `Bnum.lbencode` | Encodes a number, string, or Bnum-like value with the v2 leaderboard codec. |
+| `Bnum.Lbdecode(encoded: number): Value` | `Bnum.lbdecode` | Decodes a current v1.5 leaderboard code into a Bnum. |
 
 ---
 
-# Format Constants
+# Format and Codec Constants
 
 ```lua
 Bnum.DEFAULT_FORMAT
@@ -1154,12 +1462,21 @@ Bnum.E_NOTATION_START
 Bnum.FORMAT_PRECISION_MODE
 Bnum.ROMAN_CLASSICAL_MAX
 Bnum.ROMAN_EXTENDED_MAX
+
 Bnum.FormatTypes
 Bnum.SuffixTypes
 Bnum.Suffixes
+
+Bnum.LB_CODEC_VERSION
+Bnum.LB_SCALE
+Bnum.LB_CENTER_CODE
+Bnum.LB_MIN_FINITE_CODE
+Bnum.LB_MAX_FINITE_CODE
+Bnum.LB_INFINITY_CODE
+Bnum.LB_NAN_CODE
 ```
 
-Current defaults:
+Current formatting defaults:
 
 ```text
 DEFAULT_FORMAT         = standard
@@ -1173,30 +1490,92 @@ ROMAN_EXTENDED_MAX     = 9007199254740991
 
 ---
 
-# v1.4.0 Changes
+# v1.6.0 Changes
 
-v1.4.0 keeps the complete v1.3.3 math and formatting core and adds the full convenience layer.
+v1.6.0 is the math-kernel rebuild.
 
 Major changes:
 
-- Version updated to `1.4.0`.
-- Public API expanded from `122` to `245` functions.
-- All `122` lowercase public functions now have PascalCase counterparts.
-- Added `Bnum.SubZ(a, b)` as a convenience-only subtract-and-clamp helper.
-- Value-taking PascalCase operations accept supported `number`, `string`, and table inputs automatically.
-- `Sum`, `Product`, and `Mean` convert every array element.
-- PascalCase `*Into` wrappers convert inputs while preserving the reusable output table.
-- Unsupported auto-converted values become NaN rather than causing immediate nil indexing.
-- `Bnum.Convert(...)` keeps the original `Bnum.convert(...)` return contract.
-- The lowercase API remains unchanged for compatibility and hot-path performance.
-- v1.3.3 high-exponent suffix formatting such as `E100UCe` remains available.
-- Existing `--!native` and `--!optimize 2` directives remain intact.
+- Added private `rawAddHard`, `rawAdd`, `rawMul`, `rawDiv`, and `rawCompare` kernels.
+- Kept common finite arithmetic inline in `add`, `sub`, `mul`, `div`, and number-specialized hot paths.
+- Rebuilt higher-level math to reuse raw sign/log operations instead of duplicating full arithmetic implementations.
+- Reworked `compare`, `clamp`, `relativeDifference`, `approxEq`, `lerp`, `inverseLerp`, `remap`, `sum`, `mean`, and `percentChange`.
+- `sum` and `mean` now keep their accumulators as raw numeric fields and allocate only the final result.
+- Added `powInteger` / `PowInteger`.
+- Added `midpoint` / `Midpoint`.
+- Added `geometricMean` / `GeometricMean`.
+- Added `quadraticMean` / `QuadraticMean`.
+- Added `saturate` / `Saturate`.
+- Preserved v1.5 `toString`, `toBnumString`, and rebuilt `fromString` behavior.
+- Preserved the current safe-integer leaderboard codec.
+- Kept legacy formatter aliases and legacy leaderboard decode paths removed.
+- Public API now contains `255` functions.
+- Existing `--!native` and `--!optimize 2` directives remain.
+
+---
+
+# Migration from v1.4 README Examples
+
+The old README documented compatibility APIs that no longer exist.
+
+Replace:
+
+```lua
+Bnum.FormatSuffix(value, 2)
+Bnum.FormatSuffixLong(value, 2)
+Bnum.AutoFormat(value, 2)
+```
+
+with canonical v1.6 formatters such as:
+
+```lua
+Bnum.FormatStandard(value, 2)
+Bnum.FormatExtended(value, 2)
+Bnum.FormatHybrid(value, 2)
+Bnum.Format(value, 2, "standard")
+```
+
+Replace old capitalized format names:
+
+```text
+"Standard"
+"Scientific"
+"Engineering"
+"Auto"
+"Suffix"
+```
+
+with canonical lowercase names:
+
+```text
+"standard"
+"scientific"
+"engineering"
+```
+
+For Bnum-storage serialization, use:
+
+```lua
+Bnum.ToBnumString(value)
+```
+
+For normalized scientific serialization, keep using:
+
+```lua
+Bnum.ToString(value)
+```
 
 ---
 
 # Summary
 
-Bnum v1.4.0 now gives you two ways to use the same math system.
+Bnum v1.6.0 keeps the compact logarithmic representation:
+
+```text
+value = sign × 10^logMagnitude
+```
+
+while making the math internals cleaner and more reusable.
 
 For clean general-purpose code:
 
@@ -1205,10 +1584,17 @@ local result = Bnum.Add("1.25M", 500)
 print(Bnum.Format(result, 2))
 ```
 
-For already-converted values and hot paths:
+For already-converted hot-path values:
 
 ```lua
 local result = Bnum.add(a, b)
+```
+
+For specialized math:
+
+```lua
+local midpoint = Bnum.midpoint(a, b)
+local power = Bnum.powInteger(value, level)
 ```
 
 For allocation-sensitive loops:
@@ -1217,18 +1603,24 @@ For allocation-sensitive loops:
 Bnum.addInto(out, a, b)
 ```
 
-The core representation remains:
+For sortable leaderboard storage:
 
-```text
-value = sign × 10^logMagnitude
+```lua
+local code = Bnum.lbencode(value)
+local restored = Bnum.lbdecode(code)
 ```
 
-so the library stays compact and efficient while the v1.4 convenience layer makes ordinary call sites substantially easier to write.
+For string serialization:
+
+```lua
+local scientific = Bnum.toString(value)
+local canonicalLog = Bnum.toBnumString(value)
+```
 
 ---
 
 ## Version
 
 ```text
-Bnum v1.4.0
+Bnum v1.6.0
 ```
